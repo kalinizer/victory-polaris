@@ -965,8 +965,6 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
 /// Titles also use memory outside any buffer object as GPU memory (Grand
 /// Theft Auto VI's interface vertices, from its own allocator). Such memory
 /// gets copies of the aligned windows it touches.
-/// shortcut: copies of windows are never freed; key them to the title's
-/// allocations if memory use grows.
 const WINDOW: u64 = 4 << 20;
 
 /// Copies of title memory outside buffers, by (start, length).
@@ -980,7 +978,27 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
         return Some(shadow.clone());
     }
     if !shadow_room(len) {
-        return None;
+        // The map is the only permanent owner: a view that still uses a copy
+        // holds another Arc. Drop the copies nothing else references so the
+        // bytes (and the budget) come back, rather than refusing this window
+        // and leaving its slots to read zeros. Shadow::drop accounts for the
+        // bytes, so shadow_room sees the freed room immediately.
+        let mut freed = 0u64;
+        map.retain(|key, shadow| {
+            if Arc::strong_count(shadow) == 1 {
+                freed += shadow.len;
+                tracing::debug!(start = format_args!("{:#x}", key.0), len = key.1, "evicting unused loose shadow copy");
+                false
+            } else {
+                true
+            }
+        });
+        if freed > 0 {
+            tracing::info!(freed_mb = freed >> 20, "reclaimed unused title-memory copies");
+        }
+        if !shadow_room(len) {
+            return None;
+        }
     }
     let (buffer, data) = host()?.shared_buffer(len)?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
