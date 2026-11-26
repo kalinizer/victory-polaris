@@ -143,6 +143,10 @@ pub enum Interp {
     /// One vertex's value (`v_interp_mov_f32`), as encoded: 0 for P10,
     /// 1 for P20, 2 for P0 (the provoking vertex).
     Vertex { attribute: Attribute, vertex: u8 },
+    /// A half of an interpolation with computed i or j, or a first half
+    /// whose result is read as data: evaluate it from the vertex values
+    /// with the operand as the weight (a standalone `v_interp_p1*`/`p2*`).
+    Weighted { attribute: Attribute },
 }
 
 /// Where an interpolation's i or j register holds another value.
@@ -365,7 +369,14 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                             io.interps
                                 .push((site, Interp::Vertex { attribute, vertex }));
                         }
-                        ("v_interp_p1_f32", _) => {}
+                        // A first half whose result is read as data stands
+                        // on its own: register it as a weighted interpolation
+                        // up front. `push_pair` then finds halves a second
+                        // half pairs already there and adds nothing.
+                        ("v_interp_p1_f32", _) => {
+                            io.interps
+                                .push((site, Interp::Weighted { attribute }));
+                        }
                         ("v_interp_p2_f32", Operand::Vector { reg, .. }) => {
                             let Operand::Vector { reg: d, .. } = *dst else {
                                 return Err(unsupported(at, "an interpolation operand"));
@@ -379,7 +390,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                                     &barycentric,
                                 )
                                 .map_err(|what| unsupported(at, what))?;
-                            io.interps.push((site, interp.with(attribute)));
+                            push_pair(&mut io, site, interp, attribute);
                         }
                         _ => return Err(unsupported(at, "an interpolation form")),
                     }
@@ -395,7 +406,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                         let interp = halves
                             .pair(&v.src[0], read(2), read(1), &barycentric)
                             .map_err(|what| unsupported(at, what))?;
-                        io.interps.push((site, interp.with(attribute)));
+                        push_pair(&mut io, site, interp, attribute);
                     }
                     _ => return Err(unsupported(at, "an interpolation form")),
                 },
@@ -443,6 +454,23 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
             }
         }
     }
+    // A first half registered for its own sake that a second half later
+    // paired with goes back to being the pair's business alone: the pair's
+    // `first` sites name it, and a standalone weighted entry would make the
+    // lower emit the interpolation twice.
+    let paired: Vec<Site> = io
+        .interps
+        .iter()
+        .filter_map(|(_, interp)| match interp {
+            Interp::Interpolated { first, .. } => Some(first.iter().copied()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    io.interps.retain(|(site, interp)| match interp {
+        Interp::Weighted { .. } => !paired.contains(site),
+        _ => true,
+    });
     Ok(io)
 }
 
@@ -466,22 +494,39 @@ fn ps_vgprs(addr: u32) -> Vec<(u8, Input)> {
     out
 }
 
-/// An interpolation before its attribute is known.
+/// An interpolation before its attribute is known: `barycentric` none when
+/// i or j is computed, so the halves evaluate on their own.
 struct Pair {
-    barycentric: Barycentric,
+    barycentric: Option<Barycentric>,
     first: Vec<Site>,
     unless: Vec<Elsewhere>,
 }
 
 impl Pair {
     fn with(self, attribute: Attribute) -> Interp {
-        Interp::Interpolated {
-            attribute,
-            barycentric: self.barycentric,
-            first: self.first,
-            unless: self.unless,
+        match self.barycentric {
+            Some(barycentric) => Interp::Interpolated {
+                attribute,
+                barycentric,
+                first: self.first,
+                unless: self.unless,
+            },
+            None => Interp::Weighted { attribute },
         }
     }
+}
+
+/// Records interpolation `pair` at `site`, and its first halves too when
+/// they evaluate on their own (computed barycentrics).
+fn push_pair(io: &mut Io, site: Site, pair: Pair, attribute: Attribute) {
+    if pair.barycentric.is_none() {
+        for &f in &pair.first {
+            if !io.interps.iter().any(|(s, _)| *s == f) {
+                io.interps.push((f, Interp::Weighted { attribute }));
+            }
+        }
+    }
+    io.interps.push((site, pair.with(attribute)));
 }
 
 /// Finds the first halves of interpolations.
@@ -509,8 +554,11 @@ impl Halves<'_> {
             &mut first,
         )?;
         let mut unless = Vec::new();
-        let Some((kind, 1)) = self.joined(j, barycentric, &mut unless) else {
-            return Err("an interpolation with computed barycentrics");
+        // With j (or a first half's i) computed rather than a loaded
+        // barycentric, each half evaluates on its own (`Weighted`).
+        let mut kind = match self.joined(j, barycentric, &mut unless) {
+            Some((kind, 1)) => Some(kind),
+            _ => None,
         };
         for &(b, i) in &first {
             let inst = &self.p.blocks[b].insts[i];
@@ -529,8 +577,8 @@ impl Halves<'_> {
             if a != *attr {
                 return Err("interpolation halves of different attributes");
             }
-            if self.joined(i, barycentric, &mut unless) != Some((kind, 0)) {
-                return Err("an interpolation with computed barycentrics");
+            if kind.is_some_and(|k| self.joined(i, barycentric, &mut unless) != Some((k, 0))) {
+                kind = None;
             }
         }
         Ok(Pair {

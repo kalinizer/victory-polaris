@@ -460,6 +460,10 @@ pub struct Structured {
     pub other: HashMap<Value, Bool>,
     /// Exact Wave64 pairs for checking masks at their uses.
     paired_masks: Map<Key, Bool>,
+    /// Incoming lane boolean per predecessor edge (in block predecessor
+    /// order) for each [`Atom::Phi`] id: the masks a join brings, constants
+    /// and scalar-built ones included (ZJOU/CSS03 `phi_masks`).
+    pub phi_masks: HashMap<Value, Vec<Bool>>,
     /// Wave64 masks: low dword's value by the high dword's.
     pub highs: HashMap<Value, Value>,
     /// Masks (low dwords) set only in lanes whose EXEC bit is set where
@@ -541,6 +545,9 @@ struct Lanes<'a> {
     scc_lane: Map<Value, Bool>,
     /// Joins resolved to a constant, to check once all edges are known.
     joins: Vec<Join>,
+    /// Joins left as atoms: the mask each edge brings, for `phi_masks`.
+    phi_joins: Vec<PhiJoin>,
+    phi_join_ids: HashSet<Value>,
     /// Per block: what a lane knows on entry, over forward edges only.
     first: Vec<Bool>,
     /// Per block ending in a branch: when a lane takes it.
@@ -561,6 +568,12 @@ struct Join {
     /// The phi value naming the join.
     id: Value,
     value: bool,
+    args: Vec<Key>,
+}
+
+/// A mask join kept as an [`Atom::Phi`]: the mask on each incoming edge.
+struct PhiJoin {
+    id: Value,
     args: Vec<Key>,
 }
 
@@ -617,6 +630,8 @@ impl<'a> Lanes<'a> {
             active: HashSet::new(),
             restored: Map::default(),
             kills: HashSet::new(),
+            phi_joins: Vec::new(),
+            phi_join_ids: HashSet::new(),
         };
         for block in blocks {
             if let Exit::Branch { taken, not_taken } = block.exit
@@ -693,6 +708,8 @@ impl<'a> Lanes<'a> {
         self.first.fill(Bool::FALSE);
         self.when.fill(None);
         self.active.clear();
+        self.phi_joins.clear();
+        self.phi_join_ids.clear();
     }
 
     /// Lane masks, branch conditions and forward-edge knowledge, block by
@@ -821,6 +838,14 @@ impl<'a> Lanes<'a> {
         execs: &[Vec<Option<Bool>>],
         cond: &[Bool],
     ) -> Result<Structured, ShaderError> {
+        // A join kept as an atom still needs the mask each edge brings,
+        // including edges that come back into a loop: resolve them here,
+        // where every mask the pass found is known.
+        let mut phi_masks = HashMap::with_capacity(self.phi_joins.len());
+        for pj in std::mem::take(&mut self.phi_joins) {
+            let incoming = pj.args.iter().map(|&a| self.mask(a).0).collect();
+            phi_masks.insert(pj.id, incoming);
+        }
         let blocks = &self.p.blocks;
         let b = &mut self.b;
         let guards = blocks
@@ -891,6 +916,7 @@ impl<'a> Lanes<'a> {
             exits,
             guards,
             reach: cond.to_vec(),
+            phi_masks,
         })
     }
 
@@ -926,6 +952,18 @@ impl<'a> Lanes<'a> {
         }
         if let Some(&m) = self.other.get(&k) {
             return (m, false);
+        }
+        // A scalar pair can be parked in two VGPR lanes and restored one
+        // dword at a time. The spill pass turns these into scalar moves.
+        // Recover the original lane predicate only when the two words still
+        // come from the same known mask, in their original order (unified
+        // 9896391 / CCS03 7d0087c, DexNom 76749ce).
+        if self.p.wave64 {
+            let source = (self.move_source(k.0), self.move_source(k.1));
+            if source != k && let Some(&m) = self.masks.get(&source) {
+                self.masks.insert(k, m);
+                return (m, true);
+            }
         }
         let p = self.p;
         let restored = (
@@ -967,6 +1005,22 @@ impl<'a> Lanes<'a> {
         };
         cache.insert(k, m);
         (m, derived)
+    }
+
+    /// The value a chain of `s_mov_b32` copies originates from. Used to see
+    /// the mask behind a wave64 pair restored a dword at a time.
+    fn move_source(&self, mut value: Value) -> Value {
+        while let Some(&(b, i)) = self.defs.get(&value) {
+            let inst = &self.p.blocks[b].insts[i];
+            let [(Reg::S(_), source)] = inst.reads.as_slice() else {
+                break;
+            };
+            if inst.name() != "s_mov_b32" {
+                break;
+            }
+            value = *source;
+        }
+        value
     }
 
     /// A mask joined by phis at a block entry, and whether a mask coming in
@@ -1025,6 +1079,9 @@ impl<'a> Lanes<'a> {
                     return Some((m, derived));
                 }
             }
+        }
+        if self.phi_join_ids.insert(id) {
+            self.phi_joins.push(PhiJoin { id, args });
         }
         let born = self.index[block];
         Some((self.b.atom(Atom::Phi(id), born), derived))
@@ -1497,6 +1554,32 @@ mod tests {
             s.bools.node(when),
             Some((Atom::Lane(cmp), Bool::TRUE, Bool::FALSE))
         );
+    }
+
+    #[test]
+    fn split_scalar_copies_preserve_both_words_of_a_wave64_mask() {
+        for (high, intact) in [(0xBE83_036B, true), (0xBE83_036A, false)] {
+            let p = build(
+                &[
+                    0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                    0xBE84_046A, // s_mov_b64 s[4:5], vcc
+                    0xBF06_0100, // s_cmp_eq_u32 s0, s1
+                    0xBF85_0004, // s_cbranch_scc1 -> join at 32
+                    0xBE82_036A, // s_mov_b32 s2, vcc_lo
+                    high,        // s_mov_b32 s3, vcc_hi (or vcc_lo)
+                    0xBE84_0302, // s_mov_b32 s4, s2
+                    0xBE85_0303, // s_mov_b32 s5, s3
+                    0xBEFE_0404, // s_mov_b64 exec, s[4:5]
+                    0x7E02_0280, // v_mov_b32 v1, 0
+                    S_ENDPGM,
+                ],
+                true,
+            );
+            let s = structure(&p).unwrap();
+            let compare = p.blocks[0].insts[0].write(Reg::S(VCC)).unwrap();
+            let restored = p.blocks[2].insts[0].write(Reg::S(EXEC)).unwrap();
+            assert_eq!(s.masks[&restored] == s.masks[&compare], intact);
+        }
     }
 
     #[test]
