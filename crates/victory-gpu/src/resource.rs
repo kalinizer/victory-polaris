@@ -862,73 +862,6 @@ fn fills(desc: &ResourceDesc) -> bool {
 #[cfg(windows)]
 static FILLED_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Unconditional floor for such textures: up to 2 GiB, capped at a quarter
-/// of the reported VRAM budget.
-#[cfg(windows)]
-fn texture_floor_bytes(vram_budget: Option<u64>) -> u64 {
-    const MAX_FLOOR: u64 = 2 << 30;
-    match vram_budget {
-        Some(budget) => MAX_FLOOR.min(budget / 4),
-        None => MAX_FLOOR,
-    }
-}
-
-/// `VICTORY_TEXTURE_ROOM_PERCENT`, 50..=97, default 90.
-#[cfg(windows)]
-fn room_percent() -> u64 {
-    static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *PERCENT.get_or_init(|| {
-        std::env::var("VICTORY_TEXTURE_ROOM_PERCENT")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(90, |percent| percent.clamp(50, 97))
-    })
-}
-
-/// Bytes of the card left free for render targets and host-written copies.
-#[cfg(windows)]
-fn targets_room_kept() -> u64 {
-    use std::sync::atomic::Ordering::Relaxed;
-    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let most = *MOST.get_or_init(|| {
-        std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_MB")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(3072 << 20, |mb| mb.min(8192) << 20)
-    });
-    let targets = TEXTURE_BYTES.load(Relaxed).saturating_sub(FILLED_BYTES.load(Relaxed));
-    most.saturating_sub(targets)
-}
-
-/// May `extra` more bytes of title-filled host textures be made?
-#[cfg(windows)]
-fn room_for(memory: Option<[u64; 4]>, extra: u64) -> bool {
-    use std::sync::atomic::Ordering::Relaxed;
-    const WITHOUT_BUDGET: u64 = 4 << 30;
-    static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    let limit = *LIMIT.get_or_init(|| {
-        std::env::var("VICTORY_TEXTURE_BUDGET_MB")
-            .ok()?
-            .trim()
-            .parse::<u64>()
-            .ok()
-            .map(|mb| mb.saturating_mul(1 << 20))
-    });
-    let filled = FILLED_BYTES.load(Relaxed).saturating_add(extra);
-    if let Some(limit) = limit {
-        return filled <= limit;
-    }
-    if filled < texture_floor_bytes(memory.map(|[budget, ..]| budget)) {
-        return true;
-    }
-    match memory {
-        Some([budget, used, ..]) => {
-            used.saturating_add(targets_room_kept()) < budget / 100 * room_percent()
-        }
-        None => filled < WITHOUT_BUDGET,
-    }
-}
-
 /// Host textures alive, their bytes and the bytes of those lists used,
 /// title textures that shared one (and the bytes that saved), those that
 /// replaced their memory's.
@@ -1262,21 +1195,9 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
     use windows::core::Interface;
     let host = crate::host::host()?;
-    if fills(d) {
-        let bytes = footprint(d).map_or(0, |i| i.size);
-        if !room_for(host.video_memory(), bytes) {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| {
-                tracing::warn!(
-                    bytes_mb = bytes >> 20,
-                    filled_mb = FILLED_BYTES.load(std::sync::atomic::Ordering::Relaxed) >> 20,
-                    percent = room_percent(),
-                    "no more host copies of title-filled textures: the texture budget is reached (logged once)"
-                );
-            });
-            return None;
-        }
-    }
+    // The texture budget gate was removed: on an 8 GB card it refused
+    // textures the world still needed (`filled_mb` ~2.8 GB), leaving holes in
+    // the frame. VRAM pressure is handled by the host's own allocations.
     // The clear value names the format too: format, then color or depth
     // and stencil (5 words).
     let clear_value = (!clear.is_null()).then(|| {
@@ -1987,14 +1908,6 @@ pub(crate) fn test_buffer(width: u64) -> This {
 mod tests {
     use super::*;
     use crate::object::slot;
-
-    #[test]
-    fn texture_floor_scales_with_vram_budget() {
-        const GIB: u64 = 1 << 30;
-        assert_eq!(texture_floor_bytes(Some(8 * GIB)), 2 * GIB);
-        assert_eq!(texture_floor_bytes(Some(4 * GIB)), GIB);
-        assert_eq!(texture_floor_bytes(None), 2 * GIB);
-    }
 
     #[test]
     fn a8_unorm_is_not_in_the_r8_typeless_family() {
