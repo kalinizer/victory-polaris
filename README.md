@@ -231,6 +231,27 @@ to thousands; a few draws means the title is still stuck on a first-boot
 screen. The 3D scene being black with high draws is the current, unsolved
 failure.
 
+### 4. Black-world diagnostics (all opt-in, no code change per run)
+
+Three independent hypotheses are now testable with one binary:
+
+1. **Which plane is real?** `VICTORY_LOG_PLANES=1` logs each PresentX plane's
+   index, count, dimensions and format plus the last draw target's dimensions,
+   for listed capture frames. `VanviroDev/VIctory` found plane 0 can be a
+   surface the title never writes.
+2. **Is the lit target populated?** `VICTORY_DUMP_TARGETS=1` with
+   `VICTORY_CAPTURE_WORLD` dumps the G-buffer, the lit HDR target and the
+   presented frame at one world frame. An RX 580 reference found the G-buffer
+   complete but the lit HDR target dark — geometry present, lighting missing.
+3. **Are lighting tables starved?** `VICTORY_SCREEN_PIPELINES=1` gives one-shot
+   fullscreen pipelines a separate queue and a 20 s budget.
+
+Two present experiments can then be toggled one at a time:
+`VICTORY_PRESENT_LAST_TARGET=1` (make the last draw target the opaque base) and
+`VICTORY_PRESENT_SUBRES=1` (subresource-0 copy). Both are off by default so a
+normal run is byte-for-byte unchanged. Test them in that order, keeping the
+same `VICTORY_CAPTURE_FRAMES`, and compare the PNGs and the log counts.
+
 ## What was deliberately NOT ported
 
 These features come from other forks but are known to break this lineage or
@@ -309,6 +330,10 @@ Switches below are off when unset or `0`.
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | cap translated loop iterations per lane (own cache entries) |
 | `VICTORY_MESH_EMULATION=1\|0` | force or disable compute+vertex mesh emulation |
 | `VICTORY_MESH_BUFFER_MB=<n>` | intermediate buffer in MiB (`1..=1024`) |
+| `VICTORY_PRESENT_LAST_TARGET` | substitute the frame's last draw target for PresentX plane 0 as the compositor's opaque base (opt-in black-world experiment) |
+| `VICTORY_PRESENT_SUBRES` | single-plane present copies subresource 0 with `CopyTextureRegion` instead of `CopyResource` (upstream #3257 experiment) |
+| `VICTORY_LOG_PLANES` | with `VICTORY_CAPTURE`, log each present plane's index/count/dimensions/format and the last draw target's dimensions |
+| `VICTORY_SCREEN_PIPELINES` | give no-input/no-depth fullscreen pipelines a separate queue and a 20 s wait budget, so one-shot lighting tables are not starved behind world pipelines (upstream #2435 experiment) |
 | `VICTORY_AMBIENT=<level>` | constant ambient light for unlit surfaces (`off` for none) |
 | `VICTORY_CARD_BUFFERS_MB=<n>` | cap on host copies of title buffers |
 | `VICTORY_CARD_BUFFERS_MIN_KB=<n>` | copies smaller than this bypass the cap — set low to make the cap effective |
