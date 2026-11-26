@@ -292,14 +292,61 @@ extern "system" fn present(
         const COPY_SOURCE: u32 = 0x800;
         // SAFETY: the title passes the plane descriptions.
         let slice = unsafe { std::slice::from_raw_parts(plane_parameters, planes.min(8) as usize) };
-        let mut resources: Vec<(This, ID3D12Resource, u32, bool)> =
-            Vec::with_capacity(slice.len());
-        for plane in slice {
+        let mut handles: Vec<This> = Vec::with_capacity(slice.len());
+        for (i, plane) in slice.iter().enumerate() {
             if plane.count == 0 || plane.resources.is_null() {
                 continue;
             }
             // SAFETY: the plane lists `count` resources.
             let resource = unsafe { *plane.resources };
+            #[cfg(feature = "diagnostics")]
+            if crate::capture::wanted(frame) && crate::switch::on("VICTORY_LOG_PLANES") {
+                let d = crate::resource::host_resource(resource)
+                    .map(|texture| unsafe { texture.GetDesc() });
+                tracing::info!(
+                    frame,
+                    plane = i,
+                    count = plane.count,
+                    width = d.as_ref().map(|d| d.Width),
+                    height = d.as_ref().map(|d| d.Height),
+                    format = d.as_ref().map(|d| d.Format.0),
+                    "present plane"
+                );
+            }
+            handles.push(resource);
+        }
+        // Opt-in diagnostic (VanviroDev): the title's first PresentX plane can
+        // be a surface it never writes. Put the last draw target in its place
+        // so it becomes the compositor's opaque base; later planes still
+        // overlay it. Off by default, so the normal path is unchanged.
+        let last = if crate::switch::on("VICTORY_PRESENT_LAST_TARGET") {
+            crate::draw::last_target()
+        } else {
+            std::ptr::null()
+        };
+        if !last.is_null() {
+            if handles.is_empty() {
+                handles.push(last);
+            } else {
+                handles[0] = last;
+            }
+            #[cfg(feature = "diagnostics")]
+            if crate::capture::wanted(frame) && crate::switch::on("VICTORY_LOG_PLANES") {
+                let d = crate::resource::host_resource(last)
+                    .map(|texture| unsafe { texture.GetDesc() });
+                tracing::info!(
+                    frame,
+                    resource = format_args!("{:#x}", last as usize),
+                    width = d.as_ref().map(|d| d.Width),
+                    height = d.as_ref().map(|d| d.Height),
+                    format = d.as_ref().map(|d| d.Format.0),
+                    "last draw target substituted as present base"
+                );
+            }
+        }
+        let mut resources: Vec<(This, ID3D12Resource, u32, bool)> =
+            Vec::with_capacity(handles.len());
+        for resource in handles {
             if let Some(texture) = crate::resource::host_resource(resource) {
                 // Distinct title resources may refer to one host texture.
                 // Keep its original state for every plane and restore it once.

@@ -57,6 +57,15 @@ pub(crate) struct IndexView {
 /// texture and the view record's key.
 type TargetKey = (usize, (usize, [u32; 7]));
 
+/// The last title render target set on a list, as a title resource handle.
+/// Used only by the opt-in `VICTORY_PRESENT_LAST_TARGET` diagnostic.
+static LAST_TARGET: AtomicU64 = AtomicU64::new(0);
+
+/// The last render target a draw could have written, or 0 if none was set.
+pub(crate) fn last_target() -> This {
+    LAST_TARGET.load(Ordering::Relaxed) as This
+}
+
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
@@ -344,6 +353,7 @@ impl State {
         let mut views: Vec<(&ID3D12Resource, Option<D3D12_RENDER_TARGET_VIEW_DESC>)> =
             Vec::with_capacity(handles.len());
         let mut keys = Vec::with_capacity(handles.len());
+        let mut last = 0u64;
         for &h in handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {
                 once!(
@@ -356,11 +366,15 @@ impl State {
                 continue;
             };
             self.targets.push(record.resource as usize);
+            if last == 0 {
+                last = record.resource as u64;
+            }
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(list, record.resource);
             views.push((texture, record.desc()));
             keys.push((texture.as_raw() as usize, record.key()));
         }
+        LAST_TARGET.store(last, Ordering::Relaxed);
         self.depth = 0;
         let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
             let texture = crate::resource::host_resource(record.resource)?;

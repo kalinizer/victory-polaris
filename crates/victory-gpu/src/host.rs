@@ -2881,6 +2881,17 @@ impl Host {
         let &(primary, _) = planes.first()?;
         // SAFETY: live resources.
         let primary_desc = unsafe { primary.GetDesc() };
+        #[cfg(feature = "diagnostics")]
+        if crate::capture::wanted(frame) && crate::switch::on("VICTORY_LOG_PLANES") {
+            tracing::info!(
+                frame,
+                format = primary_desc.Format.0,
+                mips = primary_desc.MipLevels,
+                slices = primary_desc.DepthOrArraySize,
+                planes = planes.len(),
+                "present primary"
+            );
+        }
         let Some(format) = swap_format(primary_desc.Format) else {
             tracing::warn!(format = primary_desc.Format.0, "cannot present this format");
             return None;
@@ -2973,7 +2984,28 @@ impl Host {
                     D3D12_RESOURCE_STATE_COPY_DEST,
                 ));
                 list.ResourceBarrier(&before);
-                list.CopyResource(&back, texture);
+                if crate::switch::on("VICTORY_PRESENT_SUBRES") {
+                    // Opt-in (upstream #3257): CopyResource demands matching
+                    // dimensions; copying subresource 0 explicitly also avoids
+                    // bad layout on mipmapped or array textures.
+                    let from = D3D12_TEXTURE_COPY_LOCATION {
+                        pResource: std::mem::transmute_copy(texture),
+                        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                            SubresourceIndex: 0,
+                        },
+                    };
+                    let to = D3D12_TEXTURE_COPY_LOCATION {
+                        pResource: std::mem::transmute_copy(&back),
+                        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                            SubresourceIndex: 0,
+                        },
+                    };
+                    list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+                } else {
+                    list.CopyResource(&back, texture);
+                }
                 #[cfg(all(test, feature = "diagnostics"))]
                 let capture = {
                     // Inspect what reached the swap chain, before Present.
