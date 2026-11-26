@@ -1129,6 +1129,26 @@ fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> Vec<u8> {
         .to_vec()
 }
 
+/// Whether a host that rejects the directly-indexed-heap flags should be
+/// retried with plain flags (`VICTORY_ROOT_SIG_FALLBACK`). Off by default:
+/// the translated shaders bind those heaps, so a successful retry is a
+/// diagnostic, not a fix.
+fn fallback_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_ROOT_SIG_FALLBACK"))
+}
+
+/// One warning per process, naming the rejected flags and the error, so a
+/// fallback on every signature does not drown the run log.
+fn warn_fallback(flags: D3D12_ROOT_SIGNATURE_FLAGS, error: &windows::core::Error, detail: &str) {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(
+            "root signature: flags {flags:?} rejected ({error}; {detail}); retrying without directly indexed heap flags (VICTORY_ROOT_SIG_FALLBACK)"
+        );
+    }
+}
+
 fn root_signature(
     device: &ID3D12Device,
     params: &[D3D12_ROOT_PARAMETER1],
@@ -1140,7 +1160,10 @@ fn root_signature(
     } else {
         D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT
     };
-    let desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
+    let heap_indexing = D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED
+        | D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED;
+    let flags = input | heap_indexing;
+    let desc_with = |flags| D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
         Version: windows::Win32::Graphics::Direct3D12::D3D_ROOT_SIGNATURE_VERSION_1_1,
         Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
             Desc_1_1: D3D12_ROOT_SIGNATURE_DESC1 {
@@ -1148,31 +1171,72 @@ fn root_signature(
                 pParameters: params.as_ptr(),
                 NumStaticSamplers: samplers.len() as u32,
                 pStaticSamplers: samplers.as_ptr(),
-                Flags: input
-                    | D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED
-                    | D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED,
+                Flags: flags,
             },
         },
     };
+    let desc = desc_with(flags);
     // SAFETY: the description points at live arrays; the blob is read in
     // full before it is released.
     unsafe {
         let mut blob: Option<ID3DBlob> = None;
         let mut error: Option<ID3DBlob> = None;
         if let Err(e) = D3D12SerializeVersionedRootSignature(&desc, &mut blob, Some(&mut error)) {
-            if let Some(error) = error {
-                let text = std::slice::from_raw_parts(
+            let text = error.as_ref().map(|error| {
+                String::from_utf8_lossy(std::slice::from_raw_parts(
                     error.GetBufferPointer().cast::<u8>(),
                     error.GetBufferSize(),
-                );
-                tracing::warn!("root signature: {}", String::from_utf8_lossy(text));
+                ))
+                .into_owned()
+            });
+            if !fallback_on() {
+                if let Some(text) = text {
+                    tracing::warn!("root signature: {text}");
+                }
+                return Err(e);
             }
-            return Err(e);
+            warn_fallback(flags, &e, text.as_deref().unwrap_or("no serializer detail"));
+            blob = None;
+            let retry = desc_with(input);
+            let mut retry_error: Option<ID3DBlob> = None;
+            if let Err(e2) =
+                D3D12SerializeVersionedRootSignature(&retry, &mut blob, Some(&mut retry_error))
+            {
+                if let Some(error) = retry_error {
+                    let text = String::from_utf8_lossy(std::slice::from_raw_parts(
+                        error.GetBufferPointer().cast::<u8>(),
+                        error.GetBufferSize(),
+                    ));
+                    tracing::warn!("root signature retry: {text}");
+                }
+                return Err(e2);
+            }
         }
         let blob = blob.ok_or_else(windows::core::Error::empty)?;
         let bytes =
             std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
-        Ok((device.CreateRootSignature(0, bytes)?, bytes.to_vec()))
+        let root = match device.CreateRootSignature(0, bytes) {
+            Ok(root) => (root, bytes.to_vec()),
+            Err(e) if fallback_on() => {
+                warn_fallback(flags, &e, "CreateRootSignature");
+                let retry = desc_with(input);
+                let mut fallback_blob: Option<ID3DBlob> = None;
+                if D3D12SerializeVersionedRootSignature(&retry, &mut fallback_blob, None).is_ok()
+                    && let Some(fallback_blob) = fallback_blob
+                {
+                    let fallback_bytes = std::slice::from_raw_parts(
+                        fallback_blob.GetBufferPointer().cast::<u8>(),
+                        fallback_blob.GetBufferSize(),
+                    );
+                    let root = device.CreateRootSignature(0, fallback_bytes)?;
+                    (root, fallback_bytes.to_vec())
+                } else {
+                    return Err(e);
+                }
+            }
+            Err(e) => return Err(e),
+        };
+        Ok(root)
     }
 }
 
@@ -1237,5 +1301,17 @@ mod tests {
             element(DXGI_FORMAT_R32_FLOAT, D3D12_APPEND_ALIGNED_ELEMENT),
         ];
         let _ = offsets(&inputs);
+    }
+
+    /// The flags a host may reject (0xC01/0xC00) and the plain flags the
+    /// `VICTORY_ROOT_SIG_FALLBACK` retry serializes instead.
+    #[test]
+    fn root_signature_flags() {
+        let heap_indexing = D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED
+            | D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED;
+        let input = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+        assert_eq!(heap_indexing.0, 0xC00);
+        assert_eq!((input | heap_indexing).0, 0xC01);
+        assert_eq!(input.0, 0x1);
     }
 }

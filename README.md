@@ -332,6 +332,7 @@ Switches below are off when unset or `0`.
 | `VICTORY_MESH_BUFFER_MB=<n>` | intermediate buffer in MiB (`1..=1024`) |
 | `VICTORY_PRESENT_LAST_TARGET` | substitute the frame's last draw target for PresentX plane 0 as the compositor's opaque base (opt-in black-world experiment) |
 | `VICTORY_PRESENT_SUBRES` | single-plane present copies subresource 0 with `CopyTextureRegion` instead of `CopyResource` (upstream #3257 experiment) |
+| `VICTORY_ROOT_SIG_FALLBACK=1` | retry root signature serialization and creation without directly-indexed heap flags (0xC01/0xC00) if the host runtime rejects them; warns once with the flags and error (upstream #626 experiment) |
 | `VICTORY_LOG_PLANES` | with `VICTORY_CAPTURE`, log each present plane's index/count/dimensions/format and the last draw target's dimensions |
 | `VICTORY_SCREEN_PIPELINES` | give no-input/no-depth fullscreen pipelines a separate queue and a 20 s wait budget, so one-shot lighting tables are not starved behind world pipelines (upstream #2435 experiment) |
 | `VICTORY_AMBIENT=<level>` | constant ambient light for unlit surfaces (`off` for none) |
