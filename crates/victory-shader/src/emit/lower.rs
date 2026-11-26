@@ -6752,17 +6752,18 @@ impl<'a> Lower<'a> {
                 let (a, lo, hi) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
                 self.cross_lane(false)?;
                 let lane = self.lane_index();
-                let (k2, k8, k15, k16, k31, n31) = (
-                    self.s.m.i32(2),
+                let (k8, k15, k16, n31) = (
                     self.s.m.i32(8),
                     self.s.m.i32(15),
                     self.s.m.i32(16),
-                    self.s.m.i32(31),
                     self.s.m.i32(!31),
                 );
                 let nib = self.s.m.bin(c, Bin::And, lane, k15);
-                let sh = self.s.m.bin(c, Bin::Shl, nib, k2);
-                let sh = self.s.m.bin(c, Bin::And, sh, k31);
+                // The ISA packs sixteen 4-bit lane selectors into src2/src1
+                // (see wave.rs sim pick = (s >> (4 * (l & 15))) & 15), so the
+                // shift is 4 bits per lane, not 2.
+                let k4 = self.s.m.i32(4);
+                let sh = self.s.m.bin(c, Bin::Shl, nib, k4);
                 let top = self.s.m.cmp(c, pred::IUGE, nib, k8);
                 let word = self.s.m.select(c, top, hi, lo);
                 let pick = self.s.m.bin(c, Bin::LShr, word, sh);
