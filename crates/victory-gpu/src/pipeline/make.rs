@@ -40,6 +40,9 @@ pub(crate) struct Pending {
     /// whether a draw has used it yet.
     pub(crate) key: String,
     used: AtomicBool,
+    /// A one-shot full-screen pass that fills a lighting table, when the
+    /// opt-in `VICTORY_SCREEN_PIPELINES` experiment is on.
+    screen: bool,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -50,6 +53,8 @@ unsafe impl Sync for Pending {}
 
 impl Pending {
     pub(crate) fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Pending {
+        let screen = crate::switch::on("VICTORY_SCREEN_PIPELINES")
+            && graphics.as_ref().is_some_and(|g| g.screen_pass());
         let key = key(&shaders, graphics.as_deref());
         #[cfg(feature = "diagnostics")]
         log("created", &key, || {
@@ -65,6 +70,7 @@ impl Pending {
             taken: AtomicBool::new(false),
             made: OnceLock::new(),
             used: AtomicBool::new(false),
+            screen,
         }
     }
 
@@ -203,7 +209,7 @@ fn enqueue(p: &Pending, now: bool) -> Option<bool> {
     if first {
         PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
     }
-    let ahead = now && !p.now.swap(true, Ordering::Relaxed);
+    let ahead = (now || p.screen) && !p.now.swap(true, Ordering::Relaxed);
     (first || ahead && !p.taken.load(Ordering::Relaxed)).then_some(ahead)
 }
 
@@ -217,14 +223,25 @@ pub(crate) fn early(p: &Arc<Pending>) {
     }
 }
 
-/// Waits for `p` while frame `frame` has budget left.
+/// Waits for `p` while frame `frame` has budget left. One-shot lighting
+/// screen passes get their own, much larger budget when the opt-in experiment
+/// is on, so they are not dropped behind the world's 1,200+ pipelines.
 fn wait(p: &Pending, frame: u64) {
     static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
     static WAITED_US: AtomicU64 = AtomicU64::new(0);
-    if FRAME.swap(frame, Ordering::Relaxed) != frame {
-        WAITED_US.store(0, Ordering::Relaxed);
+    static SCREEN_FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
+    static SCREEN_WAITED_US: AtomicU64 = AtomicU64::new(0);
+    const SCREEN_BUDGET: Duration = Duration::from_secs(20);
+    let (frame_key, waited) = if p.screen {
+        (&SCREEN_FRAME, &SCREEN_WAITED_US)
+    } else {
+        (&FRAME, &WAITED_US)
+    };
+    let budget = if p.screen { SCREEN_BUDGET } else { BUDGET };
+    if frame_key.swap(frame, Ordering::Relaxed) != frame {
+        waited.store(0, Ordering::Relaxed);
     }
-    let left = BUDGET.saturating_sub(Duration::from_micros(WAITED_US.load(Ordering::Relaxed)));
+    let left = budget.saturating_sub(Duration::from_micros(waited.load(Ordering::Relaxed)));
     let started = Instant::now();
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -235,7 +252,7 @@ fn wait(p: &Pending, frame: u64) {
         }
         held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
     }
-    WAITED_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    waited.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
 }
 
 /// Pipelines for the workers: those draws wait for, then those started
@@ -270,7 +287,14 @@ fn queue(p: Arc<Pending>, now: bool) {
         return;
     }
     let (lock, work) = &QUEUES;
-    lock.lock().unwrap_or_else(|e| e.into_inner())[usize::from(!now)].push_back(p);
+    let mut queues = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let q = &mut queues[usize::from(!now)];
+    if p.screen {
+        q.push_front(p);
+    } else {
+        q.push_back(p);
+    }
+    drop(queues);
     work.notify_one();
 }
 

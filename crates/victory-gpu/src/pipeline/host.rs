@@ -93,6 +93,15 @@ impl Default for GraphicsState {
 }
 
 impl GraphicsState {
+    /// A full-screen pass with no inputs and no depth test: the kind that
+    /// fills one-shot lighting tables at world entry (upstream #2435).
+    pub(crate) fn screen_pass(&self) -> bool {
+        self.inputs.is_empty()
+            && !bool::from(self.depth.DepthEnable)
+            && !bool::from(self.depth.StencilEnable)
+            && self.topology == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE
+    }
+
     /// Takes in one subobject of a stream: its type, then its data at +4
     /// (+8 for those holding pointers).
     ///
