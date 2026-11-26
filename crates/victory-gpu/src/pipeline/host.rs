@@ -655,7 +655,7 @@ impl HostPipeline {
             let pso = match made {
                 Ok(pso) => pso,
                 Err(e) => {
-                    tracing::warn!(error = %e, ?shaders, "host pipeline refused");
+                    tracing::warn!(error = %e, ?shaders, "host pipeline refused (compute)");
                     host.log_messages();
                     return None;
                 }
@@ -774,7 +774,16 @@ impl HostPipeline {
         let pso = match made {
             Ok(pso) => pso,
             Err(e) => {
-                tracing::warn!(error = %e, ?shaders, "host pipeline refused");
+                tracing::warn!(
+                    error = %e,
+                    ?shaders,
+                    depth_enable = ?g.depth.DepthEnable,
+                    depth_format = ?g.depth_format,
+                    num_rts = g.targets.NumRenderTargets,
+                    topology = ?g.topology,
+                    inputs = g.inputs.len(),
+                    "host pipeline refused (graphics)"
+                );
                 host.log_messages();
                 return None;
             }
