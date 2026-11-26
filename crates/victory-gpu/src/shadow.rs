@@ -88,6 +88,99 @@ fn give_back(v: Vec<u8>) {
 /// Snapshot memory kept for reuse.
 const POOL_BYTES: usize = 2 << 30;
 
+/// Default `(min_mb, max_mb)` from the adapter's local VRAM budget. Unknown
+/// or `<= 12 GiB` (Polaris 10): `(16, 512)`.
+fn default_card_limits_mb(local_vram_budget: Option<u64>) -> (u64, u64) {
+    let Some(budget_bytes) = local_vram_budget else {
+        return (16, 512);
+    };
+    let budget_mb = budget_bytes >> 20;
+    const TWELVE_GIB_MB: u64 = 12 * 1024;
+    const TWENTY_GIB_MB: u64 = 20 * 1024;
+    if budget_mb <= TWELVE_GIB_MB {
+        (16, 512)
+    } else if budget_mb < TWENTY_GIB_MB {
+        (4, 2048)
+    } else {
+        (1, (budget_mb / 4).min(8192))
+    }
+}
+
+/// Resolve `(min_bytes, max_bytes)` from optional MiB overrides.
+fn resolve_card_limits(
+    local_vram_budget: Option<u64>,
+    min_mb_override: Option<u64>,
+    max_mb_override: Option<u64>,
+) -> (u64, u64) {
+    const MIB: u64 = 1 << 20;
+    let (default_min_mb, default_max_mb) = default_card_limits_mb(local_vram_budget);
+    let min_bytes = min_mb_override
+        .unwrap_or(default_min_mb)
+        .saturating_mul(MIB)
+        .max(MIB);
+    let max_bytes = max_mb_override.unwrap_or(default_max_mb).saturating_mul(MIB);
+    (min_bytes, max_bytes)
+}
+
+/// Once-per-process limits for host copies of title buffers. In this
+/// baseline there is no card-side twin: `max_bytes` caps the bytes of L0 /
+/// write-back system-RAM copies instead.
+fn card_limits() -> (u64, u64) {
+    static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+    *LIMITS.get_or_init(|| {
+        let env_mb = |name: &str| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+        };
+        let vram_budget = host().and_then(|h| h.video_memory()).map(|[budget, ..]| budget);
+        let (mut min_bytes, max_bytes) = resolve_card_limits(
+            vram_budget,
+            env_mb("VICTORY_CARD_BUFFERS_MIN_MB"),
+            env_mb("VICTORY_CARD_BUFFERS_MB"),
+        );
+        if let Some(kib) = std::env::var("VICTORY_CARD_BUFFERS_MIN_KB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            && kib > 0
+        {
+            min_bytes = kib << 10;
+        }
+        tracing::info!(
+            vram_budget_mb = vram_budget.map(|b| b >> 20),
+            card_buffers_min_kb = min_bytes >> 10,
+            card_buffers_max_mb = max_bytes >> 20,
+            "card buffer limits"
+        );
+        (min_bytes, max_bytes)
+    })
+}
+
+/// Bytes of live shadow copies.
+static SHADOW_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether one more copy of `size` bytes may be made.
+fn shadow_room(size: u64) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (least, most) = card_limits();
+    if size < least {
+        return true;
+    }
+    if SHADOW_BYTES.load(Relaxed).saturating_add(size) <= most {
+        return true;
+    }
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        tracing::warn!(
+            size_mb = size >> 20,
+            live_mb = SHADOW_BYTES.load(Relaxed) >> 20,
+            limit_mb = most >> 20,
+            "no more host copies of title buffers: the shadow budget is spent (logged once)"
+        );
+    });
+    false
+}
+
 // SAFETY: D3D12 resources are free-threaded; `data` is a persistent mapping
 // written only on the submitting thread.
 unsafe impl Send for Shadow {}
@@ -200,6 +293,7 @@ impl Shadow {
     }
 
     fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Arc<Shadow> {
+        SHADOW_BYTES.fetch_add(len, std::sync::atomic::Ordering::Relaxed);
         let tracked = crate::watch::track(start as usize, len as usize, true);
         let marks = tracked.as_ref().and_then(|_| marks().take(pages(start, len)));
         let shadow = Arc::new(Shadow {
@@ -602,6 +696,7 @@ impl Shadow {
 
 impl Drop for Shadow {
     fn drop(&mut self) {
+        SHADOW_BYTES.fetch_sub(self.len, std::sync::atomic::Ordering::Relaxed);
         if let Some(base) = self.marks {
             let mut m = marks();
             m.owners.remove(&base);
@@ -841,6 +936,9 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         let len = entry.end - key.0;
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
         // Shaders write some buffers (unordered access), so not upload memory.
+        if !shadow_room(len.next_multiple_of(1 << 16)) {
+            return None;
+        }
         let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(1 << 16))?;
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
         // SAFETY: a live buffer.
@@ -880,6 +978,9 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(shadow) = map.get(&(start, len)) {
         return Some(shadow.clone());
+    }
+    if !shadow_room(len) {
+        return None;
     }
     let (buffer, data) = host()?.shared_buffer(len)?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
@@ -963,6 +1064,9 @@ fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
         map.retain(|_, w| w.strong_count() > 0);
         *prune_at = (2 * map.len()).max(1024);
     }
+    if !shadow_room(len.next_multiple_of(256)) {
+        return None;
+    }
     let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
     // SAFETY: a live buffer.
@@ -1021,6 +1125,26 @@ pub(crate) fn near(va: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn card_limits_scale_with_local_vram_budget() {
+        const MIB: u64 = 1 << 20;
+        const GIB: u64 = 1 << 30;
+        assert_eq!(default_card_limits_mb(None), (16, 512));
+        assert_eq!(default_card_limits_mb(Some(8 * GIB)), (16, 512));
+        assert_eq!(default_card_limits_mb(Some(12 * GIB)), (16, 512));
+        assert_eq!(default_card_limits_mb(Some(13 * GIB)), (4, 2048));
+        assert_eq!(default_card_limits_mb(Some(20 * GIB)), (1, 5120));
+        assert_eq!(default_card_limits_mb(Some(32 * GIB)), (1, 8192));
+        assert_eq!(
+            resolve_card_limits(Some(32 * GIB), Some(8), Some(4096)),
+            (8 * MIB, 4096 * MIB)
+        );
+        assert_eq!(
+            resolve_card_limits(None, None, None),
+            (16 * MIB, 512 * MIB)
+        );
+    }
 
     /// The title writes a constant under a range an earlier list of the
     /// submission declared as written by shaders: the refresh before the
