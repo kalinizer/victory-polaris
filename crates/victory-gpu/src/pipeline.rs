@@ -566,6 +566,8 @@ fn read_stream(
         };
         at += size;
     }
+    #[cfg(windows)]
+    graphics.apply_stream_defaults();
     (shaders, graphics)
 }
 

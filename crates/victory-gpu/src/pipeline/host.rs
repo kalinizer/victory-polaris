@@ -93,6 +93,22 @@ impl Default for GraphicsState {
 }
 
 impl GraphicsState {
+    /// Upstream #2952 / #3164. D3D12 refuses a PSO with `0x80070057` when a
+    /// stream keeps the implicit depth test but never declares a DSV format,
+    /// or when unused render-target formats are left non-UNKNOWN. Apply once
+    /// after the whole stream has been read, so subobject order cannot matter.
+    pub(crate) fn apply_stream_defaults(&mut self) {
+        if self.depth_format == DXGI_FORMAT_UNKNOWN {
+            self.depth.DepthEnable = false.into();
+            self.depth.StencilEnable = false.into();
+        }
+        let n = self.targets.NumRenderTargets.min(8) as usize;
+        self.targets.NumRenderTargets = n as u32;
+        for f in self.targets.RTFormats.iter_mut().skip(n) {
+            *f = DXGI_FORMAT_UNKNOWN;
+        }
+    }
+
     /// A full-screen pass with no inputs and no depth test: the kind that
     /// fills one-shot lighting tables at world entry (upstream #2435).
     pub(crate) fn screen_pass(&self) -> bool {
