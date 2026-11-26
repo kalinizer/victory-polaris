@@ -223,6 +223,10 @@ fn table(copies: &[(u64, u64)], pairs: &[u32], null: u32) -> (Vec<u32>, Vec<usiz
                 }
                 level1[l1] = blocks.len() as u32;
                 blocks.push(l1);
+                // Grow with an exact reservation: `Vec::resize` doubling its
+                // capacity peaked at ~2x the table and aborted with
+                // E_OUTOFMEMORY during world load on 8 GB cards.
+                owner.reserve_exact(BLOCK);
                 owner.resize(owner.len() + BLOCK, None);
             }
             let entry = level1[l1] as usize * BLOCK + (page & 0xFFF) as usize;
@@ -238,7 +242,11 @@ fn table(copies: &[(u64, u64)], pairs: &[u32], null: u32) -> (Vec<u32>, Vec<usiz
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| tracing::warn!(CAPACITY, "title memory copies in more 256 MiB regions than a page table has room for: the rest read as missing"));
     }
-    let mut dwords = level1;
+    // Allocate the final size exactly: growing `dwords` with `extend` made
+    // `Vec` double its capacity and abort on a 1 MiB reallocation during
+    // world load on 8 GB cards.
+    let mut dwords = Vec::with_capacity(LEVEL1 + owner.len() * 2);
+    dwords.extend_from_slice(&level1);
     for o in &owner {
         let entry = match *o {
             Some((k, _)) => [pairs[k], copies[k].0 as u32],
