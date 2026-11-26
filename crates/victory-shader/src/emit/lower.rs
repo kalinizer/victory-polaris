@@ -31,6 +31,16 @@ enum Val {
     Missing(Why),
 }
 
+/// How an interpolation evaluates an input channel.
+#[derive(Debug, Clone, Copy)]
+enum Eval {
+    /// Loaded with this DXIL interpolation mode (1: constant, P0).
+    Mode(u8),
+    /// From the vertex values of a constant element: P0 when `p0`, plus
+    /// i (P1 - P0) and j (P2 - P0), weights as floats.
+    Weights { p0: bool, i: Option<V>, j: Option<V> },
+}
+
 pub(crate) struct Lowered {
     pub dxil: Vec<u8>,
     /// Bit n: immediate sampler n is a comparison sampler.
@@ -108,6 +118,19 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
 const TWO_PI: f32 = std::f32::consts::TAU;
 /// `s_sendmsg` id of a mesh or NGG stage's output allocation request.
 const GS_ALLOC_REQ: u16 = 9;
+
+/// The DXIL interpolation mode of a console barycentric kind.
+fn interp_mode(kind: Barycentric) -> Option<u8> {
+    Some(match kind {
+        Barycentric::PerspectiveCenter => 2,
+        Barycentric::PerspectiveCentroid => 3,
+        Barycentric::PerspectiveSample => 6,
+        Barycentric::LinearCenter => 4,
+        Barycentric::LinearCentroid => 5,
+        Barycentric::LinearSample => 7,
+        Barycentric::PerspectivePullModel => return None,
+    })
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Numeric {
@@ -542,6 +565,7 @@ impl<'a> Lower<'a> {
                 let n = i.name();
                 n.starts_with("ds_swizzle")
                     || n.contains("permute")
+                    || n.starts_with("v_permlane")
                     || n.starts_with("v_mbcnt")
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
@@ -1489,6 +1513,12 @@ impl<'a> Lower<'a> {
                     None => Val::Missing("a hardware SGPR input"),
                 },
                 Reg::Scc => Val::Missing("SCC on entry"),
+                // Most programs only interpolate with these; load them on
+                // first use as a value (`get`), so a program that never reads
+                // one does not declare an SV_Barycentrics input for it.
+                Reg::V(_) if matches!(io_inputs.get(&v), Some(Input::Barycentric { .. })) => {
+                    continue;
+                }
                 Reg::V(_) => match io_inputs.get(&v) {
                     Some(&input) => self.input(input),
                     // Registers no one set read as zero (the validator
@@ -1512,7 +1542,7 @@ impl<'a> Lower<'a> {
                     None => Val::Missing("a vertex input the signature lacks"),
                 };
             }
-            Input::Barycentric { .. } => return Val::Missing("barycentrics read directly"),
+            Input::Barycentric { kind, index } => return self.barycentric(kind, index),
             Input::PrimitiveId => return Val::Missing("the primitive id"),
             // The console code tests it against 0 (`v_cmp_ne_u32`), as the
             // host's value can be.
@@ -1706,6 +1736,146 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// A console barycentric read as data: the host's `SV_Barycentrics` of
+    /// the matching interpolation mode (i is component 1, j is 2).
+    fn barycentric(&mut self, kind: Barycentric, index: u8) -> Val {
+        let Some(mode) = interp_mode(kind) else {
+            return Val::Missing("pull-model barycentrics");
+        };
+        if index > 1 {
+            return Val::Missing("pull-model barycentrics");
+        }
+        let bary = |e: &SigElement| e.kind == 28;
+        let id = match self
+            .s
+            .inputs
+            .iter()
+            .position(|e| bary(e) && (e.interp == mode || e.usage == 0))
+        {
+            Some(id) => id,
+            None => {
+                let index = self.s.inputs.iter().filter(|e| bary(e)).count() as u32;
+                if index >= 2 {
+                    return Val::Missing("barycentrics of a third interpolation mode");
+                }
+                self.s.inputs.push(SigElement {
+                    name: "SV_Barycentrics".into(),
+                    index,
+                    kind: 28,
+                    comp: 9,
+                    interp: mode,
+                    row: None,
+                    col: 0,
+                    cols: 3,
+                    usage: 0,
+                    half: false,
+                });
+                self.s.inputs.len() - 1
+            }
+        };
+        let e = &mut self.s.inputs[id];
+        if e.col != 0 || e.cols < 3 {
+            return Val::Missing("a console barycentrics element without i and j");
+        }
+        e.row = None;
+        e.interp = mode;
+        self.s.flags |= flags::BARYCENTRICS;
+        self.load_any_input(id, index + 1)
+    }
+
+    /// Whether the program interpolates attribute row `row` (so the hardware
+    /// holds P1 - P0 and P2 - P0 for it).
+    fn interpolated(&self, row: u8) -> bool {
+        self.x.io.interps.iter().any(|(_, i)| match *i {
+            Interp::Interpolated { attribute, .. } | Interp::Weighted { attribute } => {
+                attribute.row == row
+            }
+            _ => false,
+        })
+    }
+
+    /// Whether a row is read per vertex elsewhere: its element must then be
+    /// constant, and an interpolation of it weighed with `SV_Barycentrics`.
+    fn per_vertex(&self, row: u8) -> bool {
+        self.x.io.interps.iter().any(|(_, i)| match *i {
+            Interp::Weighted { attribute } => attribute.row == row,
+            Interp::Vertex { attribute, vertex } => {
+                attribute.row == row && vertex != 2 && self.interpolated(row)
+            }
+            _ => false,
+        })
+    }
+
+    /// Vertex `k` (0 the provoking vertex, as `barycentric` orders them) of
+    /// a constant input element's channel, as a float.
+    fn vertex_input(&mut self, id: usize, col: u8, k: u8) -> V {
+        let e = &mut self.s.inputs[id];
+        e.usage |= 1 << col;
+        let int = e.comp != 9;
+        let (ty, suffix) = if int {
+            (self.s.t.i32, ".i32")
+        } else {
+            (self.s.t.f32, ".f32")
+        };
+        self.s.flags |= flags::BARYCENTRICS;
+        let entry = self.s.entry;
+        let args = [
+            self.s.m.i32(id as u32),
+            self.s.m.i32(0),
+            self.s.m.i8(col),
+            self.s.m.i8(k),
+        ];
+        let v = self.s.op(
+            entry,
+            &format!("attributeAtVertex{suffix}"),
+            Attr::ReadNone,
+            ty,
+            137,
+            &args,
+        );
+        if int {
+            self.s.m.cast(entry, Cast::Bitcast, v, self.s.t.f32)
+        } else {
+            v
+        }
+    }
+
+    /// Channel `ch` of input row `row` evaluated as `eval` says, as raw bits.
+    fn eval_channel(&mut self, row: u8, ch: u8, eval: Eval) -> Result<V, Why> {
+        let (id, col) = self
+            .find_input(row, ch)
+            .ok_or("an input the signature lacks")?;
+        let mode = match eval {
+            Eval::Mode(mode) => mode,
+            Eval::Weights { .. } => 1,
+        };
+        let e = &mut self.s.inputs[id];
+        if e.interp != mode && e.usage != 0 {
+            return Err("one input interpolated two ways");
+        }
+        e.interp = mode;
+        let Eval::Weights { p0, i, j } = eval else {
+            return match self.load_any_input(id, col) {
+                Val::I32(x) => Ok(x),
+                _ => Err("an input"),
+            };
+        };
+        let v0 = self.vertex_input(id, col, 0);
+        let c = self.cur;
+        let mut acc = p0.then_some(v0);
+        for (k, w) in [(1, i), (2, j)] {
+            let Some(w) = w else { continue };
+            let vk = self.vertex_input(id, col, k);
+            let d = self.s.m.bin(c, Bin::Sub, vk, v0);
+            acc = Some(match acc {
+                Some(a) => self.fmad(w, d, a),
+                None => self.s.m.bin(c, Bin::Mul, w, d),
+            });
+        }
+        let acc = acc.ok_or("an interpolation")?;
+        Ok(self.as_int(acc))
+    }
+
     /// The DXIL form of an IR value.
     fn get(&mut self, v: Value) -> Result<Val, Why> {
         if self.phi_at.contains_key(&v) {
@@ -1725,7 +1895,26 @@ impl<'a> Lower<'a> {
             self.vals.insert(v, val);
             return Ok(val);
         }
+        if let Some(loaded) = self.lazy_barycentric(v) {
+            loaded?;
+            return Ok(self.vals[&v]);
+        }
         Err("a value defined after its use")
+    }
+
+    /// Loads `v` if it is a barycentric input VGPR not loaded yet (see
+    /// `inputs`): `None` if it is not one.
+    fn lazy_barycentric(&mut self, v: Value) -> Option<Result<(), Why>> {
+        let (kind, index) = self.x.io.inputs.iter().find_map(|&(w, i)| match i {
+            Input::Barycentric { kind, index } if w == v => Some((kind, index)),
+            _ => None,
+        })?;
+        let val = self.barycentric(kind, index);
+        self.vals.insert(v, val);
+        Some(match val {
+            Val::Missing(w) => Err(w),
+            _ => Ok(()),
+        })
     }
 
     fn i32_of(&mut self, v: Value) -> Result<V, Why> {
@@ -6298,6 +6487,14 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.bin(c, Bin::Mul, f, k);
                 float(self, r)
             }
+            "v_cvt_f32_f64" => {
+                // The double's bits read as an IEEE-754 pair, converted in
+                // 32-bit integer arithmetic: no host `double` type needed.
+                let (lo, hi) = self.f64_pair(inst, 0)?;
+                let bits = self.f64_to_f32_bits(lo, hi);
+                let r = self.as_float(bits);
+                float(self, r)
+            }
             "v_fma_mix_f32" | "v_fma_mixlo_f16" | "v_fma_mixhi_f16" => {
                 // Each source is f32, or with op_sel_hi the low (op_sel: high)
                 // f16 half; neg_hi is the absolute value here.
@@ -6543,6 +6740,41 @@ impl<'a> Lower<'a> {
             {
                 Err("a VGPR of spilled SGPRs read per lane")
             }
+            "v_permlanex16_b32" => {
+                // Each lane reads src0 of a lane of the *other* row of 16 in
+                // its 32-lane half; lane i's pick is nibble i of the {src2,
+                // src1} selector. Both stay inside a 32-lane half, so the
+                // lane math is unchanged when a console wave64 program runs
+                // as two wave32 halves (ZJOU 212a81e).
+                if v.opsel != 0 {
+                    return Err("op_sel on v_permlanex16_b32");
+                }
+                let (a, lo, hi) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
+                self.cross_lane(false)?;
+                let lane = self.lane_index();
+                let (k2, k8, k15, k16, k31, n31) = (
+                    self.s.m.i32(2),
+                    self.s.m.i32(8),
+                    self.s.m.i32(15),
+                    self.s.m.i32(16),
+                    self.s.m.i32(31),
+                    self.s.m.i32(!31),
+                );
+                let nib = self.s.m.bin(c, Bin::And, lane, k15);
+                let sh = self.s.m.bin(c, Bin::Shl, nib, k2);
+                let sh = self.s.m.bin(c, Bin::And, sh, k31);
+                let top = self.s.m.cmp(c, pred::IUGE, nib, k8);
+                let word = self.s.m.select(c, top, hi, lo);
+                let pick = self.s.m.bin(c, Bin::LShr, word, sh);
+                let pick = self.s.m.bin(c, Bin::And, pick, k15);
+                let half = self.s.m.bin(c, Bin::And, lane, n31);
+                let row = self.s.m.bin(c, Bin::And, lane, k16);
+                let row = self.s.m.bin(c, Bin::Xor, row, k16);
+                let base = self.s.m.bin(c, Bin::Or, half, row);
+                let idx = self.s.m.bin(c, Bin::Or, base, pick);
+                let val = self.read_lane(a, idx);
+                int(self, val)
+            }
             "v_readlane_b32" => {
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
                 // A computed lane in a pixel or vertex program is a host lane
@@ -6600,6 +6832,159 @@ impl<'a> Lower<'a> {
                 int(self, r)
             }
         }
+    }
+
+    /// Reads an IEEE-754 binary64 operand as `(lo, hi)` 32-bit words, applying
+    /// `abs` and `neg` input modifiers on operand `k`.
+    fn f64_pair(&mut self, inst: &Inst, k: usize) -> Result<(V, V), Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        if v.sdwa.is_some() || v.dpp.is_some() {
+            return Err("64-bit operand modifiers");
+        }
+        let op = *v.src.get(k).ok_or("a missing operand")?;
+        let pair = |l: &mut Self, r: Reg, r1: Reg| -> Result<(V, V), Why> {
+            let lo = l.i32_of(inst.read(r).ok_or("an unread operand")?)?;
+            let hi = l.i32_of(inst.read(r1).ok_or("an unread operand")?)?;
+            Ok((lo, hi))
+        };
+        let (lo, mut hi) = match op {
+            Operand::Vector { reg, .. } => pair(self, Reg::V(reg), Reg::V(reg + 1))?,
+            Operand::Scalar { code, .. } if code != NULL => {
+                pair(self, Reg::S(code), Reg::S(code + 1))?
+            }
+            Operand::Const(128) => (self.s.m.i32(0), self.s.m.i32(0)),
+            Operand::Const(c @ 240..=248) => {
+                const INLINE_F64: [f64; 9] = [
+                    0.5,
+                    -0.5,
+                    1.0,
+                    -1.0,
+                    2.0,
+                    -2.0,
+                    4.0,
+                    -4.0,
+                    1.0 / std::f64::consts::TAU,
+                ];
+                let bits = INLINE_F64[(c - 240) as usize].to_bits();
+                (self.s.m.i32(bits as u32), self.s.m.i32((bits >> 32) as u32))
+            }
+            // GFX10 places a 32-bit literal in the high 32 bits of a 64-bit float operand.
+            Operand::Literal(x) => (self.s.m.i32(0), self.s.m.i32(x)),
+            _ => return Err("a 64-bit float operand"),
+        };
+        let c = self.cur;
+        if v.abs >> k & 1 != 0 {
+            let mask = self.s.m.i32(0x7FFF_FFFF);
+            hi = self.s.m.bin(c, Bin::And, hi, mask);
+        }
+        if v.neg >> k & 1 != 0 {
+            let sign = self.s.m.i32(0x8000_0000);
+            hi = self.s.m.bin(c, Bin::Xor, hi, sign);
+        }
+        Ok((lo, hi))
+    }
+
+    /// Converts IEEE-754 binary64 `(lo, hi)` to binary32 bits with
+    /// round-to-nearest-even, without requiring host `DOUBLES` (`f64`) support.
+    fn f64_to_f32_bits(&mut self, lo: V, hi: V) -> V {
+        let c = self.cur;
+        let k0 = self.s.m.i32(0);
+        let k1 = self.s.m.i32(1);
+        let sign_mask = self.s.m.i32(0x8000_0000);
+        let sign = self.s.m.bin(c, Bin::And, hi, sign_mask);
+
+        let k20 = self.s.m.i32(20);
+        let k7ff = self.s.m.i32(0x7FF);
+        let exp64 = self.s.m.bin(c, Bin::LShr, hi, k20);
+        let exp64 = self.s.m.bin(c, Bin::And, exp64, k7ff);
+
+        let frac_mask = self.s.m.i32(0x000F_FFFF);
+        let frac_hi = self.s.m.bin(c, Bin::And, hi, frac_mask);
+        let frac_any = self.s.m.bin(c, Bin::Or, frac_hi, lo);
+        let frac_nz = self.s.m.cmp(c, pred::NE, frac_any, k0);
+
+        let k3 = self.s.m.i32(3);
+        let k29 = self.s.m.i32(29);
+        let m23_hi = self.s.m.bin(c, Bin::Shl, frac_hi, k3);
+        let m23_lo = self.s.m.bin(c, Bin::LShr, lo, k29);
+        let m23 = self.s.m.bin(c, Bin::Or, m23_hi, m23_lo);
+
+        let rem_mask = self.s.m.i32(0x1FFF_FFFF);
+        let rem = self.s.m.bin(c, Bin::And, lo, rem_mask);
+        let half_rem = self.s.m.i32(0x1000_0000);
+        let gt_half = self.s.m.cmp(c, pred::IUGT, rem, half_rem);
+        let eq_half = self.s.m.cmp(c, pred::EQ, rem, half_rem);
+        let m23_odd_bit = self.s.m.bin(c, Bin::And, m23, k1);
+        let m23_odd = self.s.m.cmp(c, pred::NE, m23_odd_bit, k0);
+        let tie_up = self.s.m.bin(c, Bin::And, eq_half, m23_odd);
+        let norm_round = self.s.m.bin(c, Bin::Or, gt_half, tie_up);
+        let norm_inc = self.s.m.select(c, norm_round, k1, k0);
+
+        // Normal range: exp64 in [897, 1150] -> exp32 in [1, 254].
+        let k896 = self.s.m.i32(896);
+        let k23 = self.s.m.i32(23);
+        let exp32 = self.s.m.bin(c, Bin::Sub, exp64, k896);
+        let exp32_sh = self.s.m.bin(c, Bin::Shl, exp32, k23);
+        let norm_body = self.s.m.bin(c, Bin::Add, exp32_sh, m23);
+        let norm_body = self.s.m.bin(c, Bin::Add, norm_body, norm_inc);
+        let norm_res = self.s.m.bin(c, Bin::Or, sign, norm_body);
+
+        // Subnormal range: exp64 in [874, 896] -> shift in [1, 23].
+        let k897 = self.s.m.i32(897);
+        let k32 = self.s.m.i32(32);
+        let k31 = self.s.m.i32(31);
+        let imp = self.s.m.i32(0x0080_0000);
+        let sig24 = self.s.m.bin(c, Bin::Or, imp, m23);
+        let raw_shift = self.s.m.bin(c, Bin::Sub, k897, exp64);
+        // Clamp shift to [1, 23] so shifts never produce poison outside the subnormal branch.
+        let lt1 = self.s.m.cmp(c, pred::IULT, raw_shift, k1);
+        let shift = self.s.m.select(c, lt1, k1, raw_shift);
+        let gt23 = self.s.m.cmp(c, pred::IUGT, shift, k23);
+        let shift = self.s.m.select(c, gt23, k23, shift);
+        let sub_m = self.s.m.bin(c, Bin::LShr, sig24, shift);
+        let inv_shift = self.s.m.bin(c, Bin::Sub, k32, shift);
+        let lost = self.s.m.bin(c, Bin::Shl, sig24, inv_shift);
+        let round_bit = self.s.m.bin(c, Bin::LShr, lost, k31);
+        let round_on = self.s.m.cmp(c, pred::NE, round_bit, k0);
+        let low31 = self.s.m.i32(0x7FFF_FFFF);
+        let lost_lo = self.s.m.bin(c, Bin::And, lost, low31);
+        let sticky = self.s.m.bin(c, Bin::Or, lost_lo, rem);
+        let sticky_on = self.s.m.cmp(c, pred::NE, sticky, k0);
+        let sub_odd_bit = self.s.m.bin(c, Bin::And, sub_m, k1);
+        let sub_odd = self.s.m.cmp(c, pred::NE, sub_odd_bit, k0);
+        let sub_tie = self.s.m.bin(c, Bin::Or, sticky_on, sub_odd);
+        let sub_round = self.s.m.bin(c, Bin::And, round_on, sub_tie);
+        let sub_inc = self.s.m.select(c, sub_round, k1, k0);
+        let sub_body = self.s.m.bin(c, Bin::Add, sub_m, sub_inc);
+        let sub_res = self.s.m.bin(c, Bin::Or, sign, sub_body);
+
+        // Underflow range: exp64 < 874. Only exp64 == 873 with non-zero fraction rounds up to min subnormal (1).
+        let k873 = self.s.m.i32(873);
+        let eq873 = self.s.m.cmp(c, pred::EQ, exp64, k873);
+        let round_min = self.s.m.bin(c, Bin::And, eq873, frac_nz);
+        let min_bit = self.s.m.select(c, round_min, k1, k0);
+        let under_res = self.s.m.bin(c, Bin::Or, sign, min_bit);
+
+        // Overflow / Inf / NaN: exp64 >= 1151.
+        let is_exp_all = self.s.m.cmp(c, pred::EQ, exp64, k7ff);
+        let is_nan = self.s.m.bin(c, Bin::And, is_exp_all, frac_nz);
+        let inf_bits = self.s.m.i32(0x7F80_0000);
+        let qnan_bits = self.s.m.i32(0x7FC0_0000);
+        let nan_body = self.s.m.bin(c, Bin::Or, qnan_bits, m23);
+        let over_body = self.s.m.select(c, is_nan, nan_body, inf_bits);
+        let over_res = self.s.m.bin(c, Bin::Or, sign, over_body);
+
+        // Select final result by exponent range.
+        let k874 = self.s.m.i32(874);
+        let k1151 = self.s.m.i32(1151);
+        let is_under = self.s.m.cmp(c, pred::IULT, exp64, k874);
+        let is_sub = self.s.m.cmp(c, pred::IULT, exp64, k897);
+        let is_over = self.s.m.cmp(c, pred::IUGE, exp64, k1151);
+        let r = self.s.m.select(c, is_over, over_res, norm_res);
+        let r = self.s.m.select(c, is_sub, sub_res, r);
+        self.s.m.select(c, is_under, under_res, r)
     }
 
     /// A 64-bit source (a register pair; inline constants sign-extend).
@@ -7890,11 +8275,49 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// Whether a phi, or an instruction other than an interpolation's second
+    /// half (`v_interp_p2*`), reads `v`.
+    fn read_past_interpolation(&self, v: Value) -> bool {
+        self.x.p.blocks.iter().any(|b| {
+            b.phis.iter().any(|p| p.args.contains(&v))
+                || b.insts.iter().any(|i| {
+                    !i.name().starts_with("v_interp_p2") && i.reads.iter().any(|r| r.1 == v)
+                })
+        })
+    }
+
     fn interp(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
         let Some(&interp) = self.interps.get(&site) else {
+            // An unmatched first half writes zero when nothing but second
+            // halves reads its register: they take the zero as their seed.
+            // Any other reader would take it as data (ZJOU 7035d5d).
+            if inst.name().starts_with("v_interp_p1") {
+                let dst = match &inst.fields {
+                    Fields::Vintrp { dst, .. } => *dst,
+                    Fields::Valu(v) => v.dst.ok_or("an interpolation")?,
+                    _ => unreachable!(),
+                };
+                if let Operand::Vector { reg, .. } = dst
+                    && let Some(w) = inst.write(Reg::V(reg))
+                {
+                    if self.read_past_interpolation(w) {
+                        return Err("the first half of an interpolation");
+                    }
+                    let z = self.s.m.i32(0);
+                    self.write(inst, Reg::V(reg), z, None);
+                }
+                return Ok(());
+            }
             return Err("the first half of an interpolation");
         };
-        let (attribute, mode) = match interp {
+        let name = inst.name();
+        // The instruction's interpolation operand as a float (a barycentric
+        // i or j a second half takes as its weight).
+        let float = |l: &mut Self, op: Option<Operand>| -> Result<V, Why> {
+            let x = l.operand(inst, &op.ok_or("an interpolation operand")?)?;
+            Ok(l.as_float(x))
+        };
+        let (attribute, eval, add) = match interp {
             Interp::Interpolated { unless, .. } if !self.avoids(site, unless) => {
                 return Err("an interpolation with computed barycentrics");
             }
@@ -7902,24 +8325,84 @@ impl<'a> Lower<'a> {
                 attribute,
                 barycentric,
                 ..
-            } => (
-                attribute,
-                match barycentric {
-                    Barycentric::PerspectiveCenter => 2,
-                    Barycentric::PerspectiveCentroid => 3,
-                    Barycentric::PerspectiveSample => 6,
-                    Barycentric::LinearCenter => 4,
-                    Barycentric::LinearCentroid => 5,
-                    Barycentric::LinearSample => 7,
-                    Barycentric::PerspectivePullModel => return Err("pull-model interpolation"),
-                },
-            ),
+            } => {
+                let mode = interp_mode(*barycentric).ok_or("pull-model interpolation")?;
+                let eval = if self.per_vertex(attribute.row) {
+                    // Read per vertex elsewhere: constant element, weighed
+                    // with the host's `SV_Barycentrics`.
+                    let mut ij = [None; 2];
+                    for (index, w) in ij.iter_mut().enumerate() {
+                        let x = match self.barycentric(*barycentric, index as u8) {
+                            Val::I32(x) => x,
+                            Val::Missing(w) => return Err(w),
+                            Val::Bit(_) => unreachable!(),
+                        };
+                        *w = Some(self.as_float(x));
+                    }
+                    Eval::Weights {
+                        p0: true,
+                        i: ij[0],
+                        j: ij[1],
+                    }
+                } else {
+                    Eval::Mode(mode)
+                };
+                (attribute, eval, None)
+            }
             // P0, the provoking vertex: a flat (nointerpolation) input.
             Interp::Vertex {
                 attribute,
                 vertex: 2,
-            } => (attribute, 1),
+            } => (attribute, Eval::Mode(1), None),
+            // P10 and P20 are the weights the halves use when the row is
+            // interpolated: P1 - P0 and P2 - P0.
+            Interp::Vertex { attribute, vertex } if self.interpolated(attribute.row) => {
+                let one = Some(self.s.m.f32(1f32.to_bits()));
+                let (i, j) = if *vertex == 0 {
+                    (one, None)
+                } else {
+                    (None, one)
+                };
+                (attribute, Eval::Weights { p0: false, i, j }, None)
+            }
             Interp::Vertex { .. } => return Err("a non-provoking vertex value"),
+            // A first half evaluated on its own: P0 + i P10.
+            Interp::Weighted { attribute } if name.starts_with("v_interp_p1") => {
+                let src = match &inst.fields {
+                    Fields::Vintrp { src, .. } => Some(*src),
+                    Fields::Valu(v) => v.src.get(1).copied(),
+                    _ => None,
+                };
+                let i = Some(float(self, src)?);
+                (
+                    attribute,
+                    Eval::Weights {
+                        p0: true,
+                        i,
+                        j: None,
+                    },
+                    None,
+                )
+            }
+            // A second half evaluated on its own: its old dst + j P20.
+            Interp::Weighted { attribute } => {
+                let (old, src) = match &inst.fields {
+                    Fields::Vintrp { dst, src, .. } => (Some(*dst), Some(*src)),
+                    Fields::Valu(v) => (v.src.get(2).copied(), v.src.get(1).copied()),
+                    _ => (None, None),
+                };
+                let add = Some(float(self, old)?);
+                let j = Some(float(self, src)?);
+                (
+                    attribute,
+                    Eval::Weights {
+                        p0: false,
+                        i: None,
+                        j,
+                    },
+                    add,
+                )
+            }
         };
         let dst = match &inst.fields {
             Fields::Vintrp { dst, .. } => *dst,
@@ -7929,20 +8412,14 @@ impl<'a> Lower<'a> {
         let Operand::Vector { reg, .. } = dst else {
             return Err("an interpolation");
         };
-        // A channel of an input element, interpolated as `mode` says.
+        // A channel of an input element, evaluated as `eval` says.
         let channel = |l: &mut Self, row: u8, ch: u8| -> Result<V, Why> {
-            let (id, col) = l
-                .find_input(row, ch)
-                .ok_or("an input the signature lacks")?;
-            let e = &mut l.s.inputs[id];
-            if e.interp != mode && e.usage != 0 {
-                return Err("one input interpolated two ways");
-            }
-            e.interp = mode;
-            match l.load_any_input(id, col) {
-                Val::I32(x) => Ok(x),
-                _ => Err("an input"),
-            }
+            let x = l.eval_channel(row, ch, eval)?;
+            let x = l.as_float(x);
+            Ok(match add {
+                Some(a) => l.s.m.bin(l.cur, Bin::Add, a, x),
+                None => x,
+            })
         };
         let packing = match &self.x.native.io {
             StageIo::Ps { inputs, .. } => inputs
@@ -7954,7 +8431,10 @@ impl<'a> Lower<'a> {
         let f16 = inst.name().ends_with("_f16");
         let x = match packing {
             None if f16 || attribute.high => return Err("a 16-bit read of a 32-bit input"),
-            None => channel(self, attribute.row, attribute.channel)?,
+            None => {
+                let f = channel(self, attribute.row, attribute.channel)?;
+                self.as_int(f)
+            }
             Some(pack2) => {
                 // 16-bit values: one in the low half of each dword, or two
                 // per dword (`packed_half`); the host's are 32-bit floats.
@@ -7967,8 +8447,7 @@ impl<'a> Lower<'a> {
                     let Some((row, ch)) = src else {
                         return Ok(None);
                     };
-                    let x = channel(l, row, ch)?;
-                    let f = l.as_float(x);
+                    let f = channel(l, row, ch)?;
                     Ok(Some(l.narrow16(f)))
                 };
                 let h = 2 * attribute.channel;
@@ -7980,7 +8459,7 @@ impl<'a> Lower<'a> {
                     // picks the destination half.
                     let lo = self.half_modifiers(inst, lo);
                     return self.write_half(inst, lo, None);
-                } else if mode == 1 {
+                } else if matches!(eval, Eval::Mode(1)) {
                     // The whole dword of a flat input: both halves.
                     let z = self.s.m.i32(0);
                     let lo = half(self, h)?.unwrap_or(z);
