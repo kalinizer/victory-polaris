@@ -313,6 +313,34 @@ local configuration or paths to a user's files are committed. `.gitignore` is
 the first line of defence; `cargo xtask policy` (also run by the pre-commit
 hook in `.githooks/`) is the authoritative check. See `docs/asset-policy.md`.
 
+## Credits
+
+This fork would not exist without the people who did the hard parts first.
+Fixes were ported from these forks (commit hashes are where the idea came
+from, not necessarily the hash in this tree):
+
+| Fork | What we took |
+|------|--------------|
+| [yoraudev/VIctory](https://github.com/yoraudev/VIctory) — `gpu/mesh-emulation` @ `d62ba28` | The baseline. Compute + unpack-vertex mesh emulation; the only lineage that drew this title's mesh geometry on Polaris |
+| [Marvisak/VIctory](https://github.com/Marvisak/VIctory) — PR #1997, `fdc5ff5` (Yaekai, swarm, Blitz Studios) | Multi-plane PresentX compositing — the fix for the black intro, menus and HUD |
+| [FQY55kai/ZJOU-VICTORY](https://github.com/FQY55kai/ZJOU-VICTORY) | `11cdbec` bindless image dims / 8-dword size loads; `da327bf` unhostable descriptor dwords dropped instead of refusing the shader; `212a81e` `v_permlanex16_b32` (itself ported from JMAN `39979ac`); `7035d5d` unmatched `v_interp_p1` and `v_cvt_f32_f64`; `946be86` f64 abs/neg; `c156d64` weighted interpolation; `acf478b` the original bind-cache idea |
+| [JozefDeTremmerie/CCS03](https://github.com/JozefDeTremmerie/CCS03) | `7d0087c` wave64 mask restored from scalar copies; PR #999 (`f5c03f3`, by cxy0072019-sketch) `VICTORY_TEXTURE_BACK` |
+| [naixue2233/Victory-naixue2233](https://github.com/naixue2233/Victory-naixue2233) and [Itsbatt/victory-unified](https://github.com/Itsbatt/victory-unified) | `9896391`, `90228a7`, `a3d3bc9` — descriptor-selection and lane-mask recovery research (the `ir.rs::unspill` variants did not apply to this tree; the applicable parts were already present) |
+| [codec-d/cool_fox](https://github.com/codec-d/cool_fox) `ca1d519`, [GabrieelDuart/GabeGTA6](https://github.com/GabrieelDuart/GabeGTA6), [Op-lite/victory-scarlett](https://github.com/Op-lite/victory-scarlett) | Bind cache (`VICTORY_BIND_CACHE`) and low-VRAM profiling work |
+| [kzkvf88zhs-boop/ANYDEV](https://github.com/kzkvf88zhs-boop/ANYDEV), [shadany7824/LowVI](https://github.com/shadany7824/LowVI), [techselect/VIctory](https://github.com/techselect/VIctory), [Corgansm/victory-corgi](https://github.com/Corgansm/victory-corgi), [soldsawn/victory-nvidia-8gb](https://github.com/soldsawn/victory-nvidia-8gb) | Descriptor tracking by `s_cselect`/`s_cmov`, reused-register I/O, 8 GB memory policy research |
+
+Also consulted while chasing the same problems:
+[vi-7900xtx](https://github.com/gleaf-6/VIctory-7900XTX-),
+[victory-8gb-linux](https://github.com/meeyao/victory-8gb-linux.git),
+[victory-laptop-8gb](https://github.com/lordon1a/victory-laptop-8gb.git),
+[Victory-Rx580](https://github.com/kauazaniboni/Victory-Rx580.git),
+[vilocity](https://github.com/voidopcode/vilocity.git),
+[DexNom's PSO fixes](https://github.com/naixue2233/Victory-naixue2233),
+and the upstream VIctory contributors behind PRs #1240 and #999.
+
+A QA pass on this fork caught a wrong 2-bit-per-lane selector in the
+`v_permlanex16` lowering; the fix is in `36174f2`.
+
 ## License
 
 GPL-3.0-or-later. See [LICENSE](LICENSE).
