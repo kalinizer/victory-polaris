@@ -4282,10 +4282,9 @@ impl<'a> Lower<'a> {
     /// 28, dword 4 depth or layers - 1; buffer dword 2 the record count).
     // shortcut: the base level reads 0 (the host view starts at its own
     // level 0, so sizes the code shifts by it come out right) and the other
-    // dwords (addresses, formats, tiling) have no host value: reading them
-    // stops the program.
+    // dwords (addresses, formats, tiling) have no host value: they are
+    // `Missing`, so only instructions computing with them are dropped.
     fn descriptor_data(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
-        const OTHER: Why = "a descriptor's address or format read as data";
         let Fields::Smem {
             data: Some(Operand::Scalar { code, .. }),
             ..
@@ -4346,6 +4345,38 @@ impl<'a> Lower<'a> {
                 .find_map(|&(s, _)| use_of(s))
         });
         let Some((at, first)) = use_at else {
+            // An image descriptor (8 dwords) nothing reads as a descriptor, whose only
+            // dwords read as numbers are its size fields 1-3: the title measures a
+            // texture it samples by another index (fxceless `image_size_only`). A
+            // 2D image is assumed; dword 4 is not read in that case.
+            let read = |k: u32| {
+                inst.write(Reg::S(code + k as u8)).is_some_and(|v| {
+                    self.x
+                        .p
+                        .blocks
+                        .iter()
+                        .flat_map(|b| &b.insts)
+                        .any(|i| i.reads.iter().any(|r| r.1 == v))
+                })
+            };
+            if count == 8 && (0..count).all(|k| (1..=3).contains(&k) || !read(k)) {
+                return self.descriptor_words(inst, site, 0, (2, 0x409), Some(2), false);
+            }
+            // A nameless bindless read of several dwords from the resource heap:
+            // the title reads a texture's size bits from a descriptor it picks by
+            // an index, with no instruction left naming the view. Take it for a
+            // 2D image and rebuild those bits from the host view (ZJOU 11cdbec).
+            if count >= 5
+                && self.scalar.get(&site).is_some_and(|a| {
+                    self.x
+                        .native
+                        .layout
+                        .get(a.param)
+                        .is_some_and(|rp| rp.root == RootType::ResourceHeap)
+                })
+            {
+                return self.descriptor_words(inst, site, 0, (2, 0x409), Some(2), false);
+            }
             return self.view_addresses(inst, site, code, count);
         };
         let src = Source::Loaded { load: site, first };
@@ -4401,6 +4432,43 @@ impl<'a> Lower<'a> {
             }
             _ => return Err("a scalar memory read as data"),
         };
+        self.descriptor_words(inst, site, first, props, image, uav)
+    }
+
+    /// The GFX10 descriptor words of the view `site` loads, rebuilt from the
+    /// host view's dimensions as [`Self::descriptor_data`] did inline:
+    /// `props`, `image` and `uav` say the view's kind (a 2D image is assumed
+    /// for a nameless bindless read), `first` the dword the load starts at.
+    /// Dwords with no host value hold `Missing`, so only the instructions that
+    /// compute with them are dropped rather than the whole program (ZJOU
+    /// 11cdbec/da327bf).
+    fn descriptor_words(
+        &mut self,
+        inst: &Inst,
+        site: Site,
+        first: u8,
+        props: (u32, u32),
+        image: Option<u32>,
+        uav: bool,
+    ) -> Result<(), Why> {
+        const OTHER: Why = "a descriptor's address or format read as data";
+        let Fields::Smem {
+            data: Some(Operand::Scalar { code, .. }),
+            ..
+        } = inst.fields
+        else {
+            return Err("a scalar memory read as data");
+        };
+        let count = match inst.name().strip_prefix("s_load_dword") {
+            Some("") => 1u32,
+            Some("x2") => 2,
+            Some("x4") => 4,
+            Some("x8") => 8,
+            Some("x16") => 16,
+            _ => return Err("a scalar memory read as data"),
+        };
+        let src = Source::Loaded { load: site, first };
+        let used = self.used_kind(&src);
         let h = self.handle(site, &src, false, props)?;
         let c = self.cur;
         let i32t = self.s.t.i32;
@@ -4451,7 +4519,18 @@ impl<'a> Lower<'a> {
                 let d3 = self.s.m.bin(c, Bin::Or, base, last);
                 vec![(1, d1), (2, d2), (3, d3), (4, depth)]
             }
-            None => vec![(2, field(self, 0))],
+            None => {
+                // A raw view counts bytes; the descriptor's record count is in elements.
+                let n = field(self, 0);
+                let stride = used.map_or(0, |u| u.stride);
+                let n = if props.0 & 0xFF == 11 && stride > 1 {
+                    let k = self.s.m.i32(stride);
+                    self.s.m.bin(c, Bin::UDiv, n, k)
+                } else {
+                    n
+                };
+                vec![(2, n)]
+            }
         };
         for k in 0..count {
             let rel = k.wrapping_sub(u32::from(first));
@@ -4782,24 +4861,54 @@ impl<'a> Lower<'a> {
 
     /// A descriptor load from a table or heap whose dwords the program only
     /// reads as numbers: the base address of a buffer view (dwords 0 and 1,
-    /// as a pointer to title memory: the BVH's address in its SRV). They
-    /// come from the host's view addresses, `t1` in
-    /// [`super::shader::MEMORY_SPACE`]: two dwords per heap index.
+    /// as a pointer to title memory: the BVH's address in its SRV) and its
+    /// record count (dword 2, fxceless `records_of`). They come from the
+    /// host's view addresses, `t1` in [`super::shader::MEMORY_SPACE`]: two
+    /// dwords per heap index.
     // shortcut: dword 1 holds the address bits only (stride and swizzle read
     // 0); the other dwords stop the program when read; the table offset's
     // computed part is taken as whole descriptors (32-byte multiples).
     fn view_addresses(&mut self, inst: &Inst, site: Site, code: u8, count: u32) -> Result<(), Why> {
         const OTHER: Why = "a descriptor read only as data";
-        let a = *self
-            .scalar
-            .get(&site)
-            .ok_or("a descriptor read only as data")?;
+        // What cannot be resolved is dropped with the instructions that read
+        // it (`Val::Missing`), not refused as a reason to drop the program
+        // (ZJOU da327bf).
+        let drop = |l: &mut Self| {
+            for k in 0..count {
+                if let Some(v) = inst.write(Reg::S(code + k as u8)) {
+                    l.vals.insert(v, Val::Missing(OTHER));
+                }
+            }
+            Ok(())
+        };
+        let Some(&a) = self.scalar.get(&site) else {
+            return drop(self);
+        };
         if !matches!(
             self.x.native.layout.get(a.param).map(|p| p.root),
             Some(RootType::Table | RootType::ResourceHeap)
         ) {
-            return Err("a descriptor read only as data");
+            return drop(self);
         }
+        // A buffer's record count is queried where the code tests an empty
+        // buffer; take it from the host view (raw bytes or structured
+        // elements), as the used-resource entry says (fxceless `records_of`).
+        let count_word_read = (0..count).find(|&k| (a.offset / 4 + k) % 8 == 2).and_then(|k| {
+            inst.write(Reg::S(code + k as u8))
+                .filter(|v| {
+                    self.x
+                        .p
+                        .blocks
+                        .iter()
+                        .flat_map(|b| &b.insts)
+                        .any(|i| i.reads.iter().any(|r| r.1 == *v))
+                })
+        });
+        let records = if count_word_read.is_some() {
+            self.records_of(site)?
+        } else {
+            None
+        };
         let views = self.s.view_addresses_handle();
         for k in 0..count {
             let word = (a.offset / 4 + k) % 8;
@@ -4811,6 +4920,8 @@ impl<'a> Lower<'a> {
                 let w = self.s.m.i32(4 * word);
                 let at = self.s.m.bin(c, Bin::Add, at, w);
                 Val::I32(self.raw_dword(views, at))
+            } else if word == 2 {
+                records.map_or(Val::Missing(OTHER), Val::I32)
             } else {
                 Val::Missing(OTHER)
             };
@@ -4819,6 +4930,37 @@ impl<'a> Lower<'a> {
             }
         }
         Ok(())
+    }
+
+    /// The record count (GFX10 V# dword 2) of the buffer view the table load
+    /// at `site` reads, from the host view's size: in bytes for a raw view,
+    /// in elements of the range's stride for a structured one. `None` where
+    /// the table range names no such buffer view (fxceless `records_of`).
+    fn records_of(&mut self, site: Site) -> Result<Option<V>, Why> {
+        let src = Source::Loaded { load: site, first: 0 };
+        let Some(used) = self.used_kind(&src).copied() else {
+            return Ok(None);
+        };
+        if used.dwords != 4 || !matches!(used.kind, ResourceType::Srv | ResourceType::Uav) {
+            return Ok(None);
+        }
+        let u = if used.kind == ResourceType::Uav { 0x1000 } else { 0 };
+        let h = self.handle(site, &src, false, (11 | u, 0))?;
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+        let mip = self.s.m.undef(i32t);
+        let d = self
+            .s
+            .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip]);
+        let n = self.s.m.extract(c, d, 0);
+        let n = if used.stride > 1 {
+            let k = self.s.m.i32(used.stride);
+            self.s.m.bin(c, Bin::UDiv, n, k)
+        } else {
+            n
+        };
+        Ok(Some(n))
     }
 
     /// `s_load_dword*` from the program's constant table.
@@ -5273,25 +5415,11 @@ impl<'a> Lower<'a> {
             }
             Source::Phi { block, args } => {
                 // Each predecessor computes its heap index at its end; the
-                // join picks one with a phi.
+                // join picks one with a phi. A predecessor whose descriptor
+                // is itself chosen by an earlier join is handled too (ZJOU
+                // `descriptor_phi`).
                 let _ = site;
-                let mut incoming = Vec::new();
-                for (&q, arg) in self.x.p.blocks[*block].preds.iter().zip(args) {
-                    if self.block[q].is_none() {
-                        continue;
-                    }
-                    let (Some(tail), Source::Loaded { load, first }) = (self.tail[q], arg) else {
-                        return Err("a descriptor chosen by control flow");
-                    };
-                    let at = self.edges.get(&(q, *block)).copied().unwrap_or(tail);
-                    let here = std::mem::replace(&mut self.cur, at);
-                    let index = self.heap_index(*load, *first, sampler);
-                    self.cur = here;
-                    incoming.push((index?, at));
-                }
-                let join = self.block[*block].ok_or("a descriptor chosen by control flow")?;
-                let phi = self.s.m.phi(join, self.s.t.i32);
-                self.s.m.set_phi(phi, incoming);
+                let phi = self.descriptor_phi(*block, args, sampler, 8)?;
                 let index = self.buffer_guard(src, phi, sampler, props);
                 Ok(self.s.heap_handle(self.cur, index, sampler, false, props))
             }
@@ -5323,6 +5451,47 @@ impl<'a> Lower<'a> {
                 Ok(self.s.heap_handle(self.cur, index, sampler, true, props))
             }
         }
+    }
+
+    /// The heap index a descriptor phi picks. Each predecessor computes its
+    /// heap index at its end and the join picks one with a phi; a predecessor
+    /// whose descriptor is itself chosen by control flow (a phi of an earlier
+    /// join, which dominates it) gives that join's phi, at most `depth` joins
+    /// deep (ZJOU `descriptor_phi`).
+    fn descriptor_phi(
+        &mut self,
+        block: usize,
+        args: &[Source],
+        sampler: bool,
+        depth: u32,
+    ) -> Result<V, Why> {
+        const WHY: Why = "a descriptor chosen by control flow";
+        let p = self.x.p;
+        let mut incoming = Vec::new();
+        for (&q, arg) in p.blocks[block].preds.iter().zip(args) {
+            if self.block[q].is_none() {
+                continue;
+            }
+            let tail = self.tail[q].ok_or(WHY)?;
+            let at = self.edges.get(&(q, block)).copied().unwrap_or(tail);
+            let index = match arg {
+                Source::Loaded { load, first } => {
+                    let here = std::mem::replace(&mut self.cur, at);
+                    let index = self.heap_index(*load, *first, sampler);
+                    self.cur = here;
+                    index?
+                }
+                Source::Phi { block: inner, args: inner_args } if depth > 0 => {
+                    self.descriptor_phi(*inner, inner_args, sampler, depth - 1)?
+                }
+                _ => return Err(WHY),
+            };
+            incoming.push((index, at));
+        }
+        let join = self.block[block].ok_or(WHY)?;
+        let phi = self.s.m.phi(join, self.s.t.i32);
+        self.s.m.set_phi(phi, incoming);
+        Ok(phi)
     }
 
     /// The heap index to read a buffer view at, for a descriptor `src` from
