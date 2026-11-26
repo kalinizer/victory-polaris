@@ -1374,6 +1374,35 @@ pub(crate) fn texture_memory(this: This) -> Option<(*const u8, ResourceDesc)> {
     (r.desc.dimension != BUFFER).then(|| (r.data().cast_const(), r.desc))
 }
 
+/// The kind of a title texture: width, height and format.
+#[cfg(windows)]
+pub(crate) fn texture_kind(this: This) -> Option<(u64, u32, u32)> {
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    const TEXTURE_2D: u32 = 3;
+    (r.desc.dimension == TEXTURE_2D && r.desc.sample_count <= 1)
+        .then_some((r.desc.width, r.desc.height, r.desc.format))
+}
+
+/// A title texture's console layout, allocation address and size.
+#[cfg(windows)]
+pub(crate) fn title_texture(this: This) -> Option<(victory_formats::texture::Layout, usize, usize)> {
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    if r.desc.dimension == BUFFER {
+        return None;
+    }
+    let t = texture_layout(&r.desc)?;
+    let [plane] = &t.planes[..] else {
+        return None;
+    };
+    Some((plane.layout.clone(), r.data() as usize, t.size as usize))
+}
+
 /// A texture's format as the title gave it.
 pub(crate) fn title_format(this: This) -> Option<u32> {
     (!this.is_null()).then(|| resource(this).desc.format)
@@ -1437,6 +1466,9 @@ fn hand_out_resource(
     #[cfg(windows)]
     {
         resource.host = shared_texture(resource.data() as u64, &desc, state, clear);
+        if desc.dimension != BUFFER {
+            crate::texback::replaced(resource.data() as usize);
+        }
     }
     #[cfg(windows)]
     if desc.dimension == BUFFER {
@@ -1519,6 +1551,7 @@ impl Drop for Resource {
         }
         crate::bindless::forget(std::ptr::from_ref::<Resource>(self) as usize);
         if self.desc.dimension != BUFFER {
+            crate::texback::released(std::ptr::from_ref::<Resource>(self) as usize);
             let mut map = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
             let at = self.data() as u64;
             if let Some(list) = map.get_mut(&at) {
