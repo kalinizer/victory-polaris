@@ -1901,7 +1901,18 @@ impl<'a> Lower<'a> {
             None => (v, false),
         };
         let &m = self.x.st.masks.get(&lo).ok_or(LANE_MASK)?;
-        if !self.x.st.active.contains(&lo) && !self.ballots.contains_key(&lo) {
+        // A join whose incoming masks are all active can be balloted at the
+        // join: the lanes with the bit set arrive there. It has no one scalar
+        // instruction to rebuild its number from, so the numeric path would
+        // refuse a register the compiler reused as data on another path.
+        let p = self.x.p;
+        let active_join = self.phi_at.get(&lo).is_some_and(|&(b, i)| {
+            p.blocks[b].phis[i]
+                .args
+                .iter()
+                .all(|a| self.x.st.active.contains(a))
+        });
+        if !active_join && !self.x.st.active.contains(&lo) && !self.ballots.contains_key(&lo) {
             let xy = self.mask_number(lo)?;
             self.ballots.insert(lo, xy);
         }
@@ -10556,18 +10567,22 @@ impl<'a> Lower<'a> {
         for (phi, incoming) in std::mem::take(&mut self.counters).into_values() {
             self.s.m.set_phi(phi, incoming);
         }
+        // The structure pass records each join's incoming masks, including
+        // constants, scalar-built ones and back edges (ZJOU/CSS03
+        // `phi_masks`): a lookup of the edge's own value alone misses those.
+        let st = self.x.st;
         while let Some((v, b, i)) = self.pending_masks.pop() {
             let phi = &p.blocks[b].phis[i];
             let offset = p.blocks[b].offset;
+            let args = st
+                .phi_masks
+                .get(&phi.value)
+                .ok_or_else(|| unsupported(offset, "a lane-mask join of an untracked mask"))?;
             let mut incoming = Vec::new();
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
-                let m =
-                    *self.x.st.masks.get(&phi.args[n]).ok_or_else(|| {
-                        unsupported(offset, "a lane-mask join of an untracked mask")
-                    })?;
-                let x = self.boolean(m, qb).map_err(|w| unsupported(offset, w))?;
+                let x = self.boolean(args[n], qb).map_err(|w| unsupported(offset, w))?;
                 incoming.push((x, qb));
             }
             self.s.m.set_phi(v, incoming);
