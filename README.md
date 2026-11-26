@@ -19,34 +19,42 @@ not a claim about other hardware.
 
 ## Status (2026-11-27)
 
-**The world renders in full color, but it is slow and not yet a stable play
-experience.** The hard blockers — the composited black screen and the dropped
-world shaders — are fixed and verified. What remains is mostly memory growth
-and frame pacing.
+**Not playable. The 3D world is still black.** The UI, menus, map, audio and
+the 2D presentation planes work, and the host submits tens of thousands of
+draws, but the rendered 3D scene has never appeared on screen on this machine.
 
 | Stage | Observed on this machine |
 |---|---|
 | Boot, first-boot screens, profile/save | works (needs scripted keys, see below) |
-| Intro cinematic, sound, music, ambience | works |
+| Intro cinematic audio, sound, music, ambience | works |
 | Money UI, phone message UI, map (CENTER / 2D VIEW / ADD MARKER / SET DESTINATION / EXIT) | works |
-| Loading art | full color (was solid black) |
-| First mission's cinematic | **full color** — character, boat, waterfront bridge, wind turbines, water reflections (was solid black) |
+| 2D presentation planes (splash, loading art, UI) | full color (were solid black before the compositor fix) |
+| **3D world / first mission's cinematic** | **black** — see the warning below |
 | World geometry submitted | confirmed: up to **17,285 draws/frame**, emulated mesh pipelines active |
-| Live gameplay frames | reached frame ~46,000 with ~5,900 draws/frame; still shows intermittent black-frame warnings and is very slow (~1 fps or worse) |
-| Memory | grows without bound in long sessions (see [Memory](#memory-the-last-open-problem)); a hard fix landed locally but has not yet been verified in a full run |
+| Live gameplay frames | reached frame ~46,000 with ~5,900 draws/frame; black-frame warnings, very slow (~1 fps or worse) |
+| Memory | grows without bound in long sessions (see [Memory](#memory-the-last-open-problem)); a fix is committed but has not yet been verified in a full run |
 
-Verification numbers from the run that first proved the fix:
+> **Do not mistake the captures for the world.** `frame-17000.png`,
+> `frame-18000.png`, `frame-20000.png` and `frame-32768.png` are 1.4–2.5 MB
+> full-color images, but they show the **2D PresentX presentation plane** —
+> splash and loading art — composited by the fix below. A solid-black frame is
+> ~6,121 bytes at 1920×1080, so a large PNG proves that *something* was
+> presented; it does **not** prove that 3D geometry or the world shaders are
+> working. The user's own check confirms the 3D scene remains black.
+
+Translation counts from the diagnostic run:
 
 - `shader does not translate`: **14** (hundreds/thousands before the shader fixes)
 - `shader translated`: **2,511**
-- Captured PNGs: solid-black frames are **6,121 bytes** at 1920×1080; the
-  full-color cinematic frames are **1.4–2.5 MB**. `frame-17000.png`,
-  `frame-18000.png`, `frame-20000.png` and `frame-32768.png` are real images.
+- These errors are real and were reduced, but clearing them did **not** by
+  itself restore the 3D world.
 
 ## Why this fork exists
 
-Getting from "black window with working audio" to "full-color world" took
-four separate fixes. Each was found from the log, not guessed.
+Getting from a completely black window to a working UI with sound, and getting
+the host to submit real world geometry, took several separate fixes. Each was
+found from the log, not guessed. **None of them has made the 3D world visible
+yet.**
 
 **1. The GPU has no mesh shaders.** The title's world is entirely mesh-shader
 geometry. On this card the host reports:
@@ -68,7 +76,7 @@ but the screen is black". Ported from upstream PR #1997 (commit `376cd51`,
 merged as `ea7625e`); `queue.rs` walks all planes at a 0x48-byte stride and
 `host.rs` alpha-composites them. After this, the loading art appeared.
 
-**3. The 3D world was black because its shaders were being dropped.** The
+**3. World shaders were being dropped — but fixing that was not enough.** The
 translator rejected GFX10 constructs the title's world shaders use:
 
 ```
@@ -87,7 +95,8 @@ Those pixel/compute programs were refused, so their draws emitted no pixels.
 The UI survived because its shaders are simple. Fixes were ported from the
 ZJOU / naixue / unified / CCS03 forks and merged in `74dacbe`; a QA review
 caught a wrong 2-bit-per-lane selector in the `v_permlanex16` lowering, fixed
-in `36174f2` to the ISA's 4 bits per lane.
+in `36174f2` to the ISA's 4 bits per lane. The refusal count fell dramatically
+but the world is still black, so another cause remains.
 
 **4. Two OOM classes had to be fixed separately.**
 
@@ -214,10 +223,13 @@ Select-String -LiteralPath $log -SimpleMatch 'host mesh shader support mode=Emul
 Get-ChildItem $env:VICTORY_CAPTURE -Filter '*.png' | Sort-Object Length -Descending | Select-Object -First 8 Name,Length
 ```
 
-A solid-black frame is ~6,121 bytes at 1920×1080. **Any world frame over
-100 KB is proof that pixels are being produced.** Draws in world frames should
-be in the hundreds to thousands; a few draws means the title is still stuck
-on a first-boot screen.
+A solid-black frame is ~6,121 bytes at 1920×1080; a full-color frame is
+1.4–2.5 MB. But **a large PNG only proves that the 2D presentation plane was
+composited — it is not proof that the 3D world renders.** Check what is in the
+image before claiming progress. Draws in world frames should be in the hundreds
+to thousands; a few draws means the title is still stuck on a first-boot
+screen. The 3D scene being black with high draws is the current, unsolved
+failure.
 
 ## What was deliberately NOT ported
 
