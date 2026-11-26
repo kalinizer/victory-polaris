@@ -79,14 +79,26 @@ fn give_back(v: Vec<u8>) {
     pool.push(v);
     pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
     let mut total = 0;
+    let limit = pool_bytes();
     pool.retain(|v| {
         total += v.capacity();
-        total <= POOL_BYTES
+        total <= limit
     });
 }
 
-/// Snapshot memory kept for reuse.
-const POOL_BYTES: usize = 2 << 30;
+/// Snapshot memory kept for reuse. 2 GiB of permanently-touched pages is
+/// too much on a 16 GB machine; the world only snapshots ~100 MB a frame.
+/// `VICTORY_SNAPSHOT_POOL_MIB` overrides it (0 disables reuse).
+fn pool_bytes() -> usize {
+    static BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| {
+        std::env::var("VICTORY_SNAPSHOT_POOL_MIB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(512)
+            .saturating_mul(1 << 20)
+    })
+}
 
 /// Default `(min_mb, max_mb)` from the adapter's local VRAM budget. Unknown
 /// or `<= 12 GiB` (Polaris 10): `(16, 512)`.

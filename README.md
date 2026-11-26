@@ -337,6 +337,7 @@ Switches below are off when unset or `0`.
 | `VICTORY_AMBIENT=<level>` | constant ambient light for unlit surfaces (`off` for none) |
 | `VICTORY_CARD_BUFFERS_MB=<n>` | cap on host copies of title buffers |
 | `VICTORY_CARD_BUFFERS_MIN_KB=<n>` | copies smaller than this bypass the cap — set low to make the cap effective |
+| `VICTORY_SNAPSHOT_POOL_MIB=<n>` | snapshot buffers kept for reuse (default 512 MiB, was hardcoded 2 GiB; 0 disables reuse) — lowers resident memory on 16 GB machines |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | record what the title plays |
 | `VICTORY_XMA_DUMP=<dir>` | save the first 32 XMA voices' context and input |
 
