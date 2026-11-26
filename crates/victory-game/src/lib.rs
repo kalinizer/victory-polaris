@@ -17,13 +17,49 @@ pub struct KnownBuild {
     pub blake3: &'static str,
     /// RPF9 archive the title needs during startup, relative to its executable.
     pub startup_archive: &'static str,
+    /// Changes to its code made before it is mapped.
+    pub patches: &'static [CodePatch],
 }
+
+/// A change to title code: at `rva`, the bytes `expect` (a short signature
+/// checked before anything is written) become `write`, our own code.
+#[derive(Debug, Clone, Copy)]
+pub struct CodePatch {
+    /// Our name for it, as logged.
+    pub name: &'static str,
+    pub rva: u32,
+    pub expect: &'static [u8],
+    pub write: &'static [u8],
+}
+
+/// `mov eax, 6; ret`: the upscaler a Series X uses.
+const UPSCALER_6: &[u8] = &[0xb8, 0x06, 0x00, 0x00, 0x00, 0xc3];
 
 /// Executables identified from a local package.
 pub const KNOWN_BUILDS: &[KnownBuild] = &[KnownBuild {
     label: "Series 1.0.2.1",
     blake3: "b99f876b74d4a77f03af5f878223b27bd647b5c35a79d5decd9f716504239e93",
     startup_archive: "appdata0.rpf",
+    // On a Series S the title picks FSR 4 (type 7) when FidelityFX is
+    // present. Its output never reaches the screen under VIctory (black
+    // world frames), and withholding the DLL makes the title divide by
+    // zero in the FSR 4 wrapper. Both functions that make the choice return
+    // 6 (the title's own upscaler) instead. From soldsawn/victory-nvidia-8gb
+    // c750c57; the build hash matches this dump exactly.
+    patches: &[
+        CodePatch {
+            name: "upscaler choice",
+            rva: 0x7e_93f0,
+            expect: &[0x48, 0x83, 0xec, 0x28, 0x80, 0x3d],
+            write: UPSCALER_6,
+        },
+        CodePatch {
+            name: "upscaler choice (the per-frame copy)",
+            rva: 0x540_0190,
+            expect: &[0x48, 0x83, 0xec, 0x28, 0x48, 0x8b],
+            write: UPSCALER_6,
+        },
+    ],
 }];
 
 /// Looks up a build by the BLAKE3 hash of its executable.

@@ -385,6 +385,35 @@ extern "system" fn removed_reason(_: This) -> HRESULT {
     S_OK
 }
 
+/// Device methods 0x1c8 and 0x218. Grand Theft Auto VI calls both with
+/// `(this, description, iid, out)` and goes without the pipeline when they
+/// fail. Write `null` to `out` before returning `E_NOTIMPL`: leaving it
+/// untouched hands the title a stale stack pointer, which it later reads
+/// (an access violation at address `-1` after an FSR4 pipeline fallback).
+/// From cool_fox 578d459; both slots were generic `missing` handlers here.
+extern "system" fn unknown_pipeline<const SLOT: usize>(
+    _: This,
+    _desc: *const u8,
+    _iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static CALLS: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
+    let calls = CALLS[usize::from(SLOT == 0x218)].fetch_add(1, Ordering::Relaxed) + 1;
+    if !out.is_null() {
+        // SAFETY: the title's out pointer (a local of its own).
+        unsafe { *out = std::ptr::null() };
+    }
+    if calls <= 4 || calls.is_power_of_two() {
+        tracing::warn!(
+            slot = format_args!("{SLOT:#x}"),
+            calls,
+            "a pipeline creation method that is not implemented: the title goes without this pipeline"
+        );
+    }
+    E_NOTIMPL
+}
+
 /// IUnknown 3, object methods 4, device methods 76 (0x18-0x290), then the
 /// methods `ID3D12Device1` to `ID3D12Device8` add, in order: 3, 1, 3, 6, 9,
 /// 1, 2, 9 (0x298-0x3a0, the console's own among them), then those of
@@ -422,8 +451,10 @@ static FUNCTIONS: Table<160> = {
     f[39] = query::create as *const (); // 0x138
     f[41] = signature::create as *const (); // 0x148
     f[48] = queue::create_x as *const (); // 0x180
+    f[57] = unknown_pipeline::<0x1c8> as *const (); // 0x1c8
     f[61] = descriptor::create_sampler_x as *const (); // 0x1e8
     f[62] = pipeline::create_compute_x as *const (); // 0x1f0
+    f[67] = unknown_pipeline::<0x218> as *const (); // 0x218
     f[69] = object::ignore as *const (); // 0x228 debug error filter
     f[70] = descriptor::create_placed_srv as *const (); // 0x230
     f[71] = descriptor::create_placed_uav as *const (); // 0x238
