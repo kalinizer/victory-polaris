@@ -1527,8 +1527,9 @@ impl HostList {
         }
         // SAFETY: our list.
         if let Err(e) = unsafe { self.list.Close() } {
+            let detail = host().and_then(|h| h.log_messages()).unwrap_or_default();
             fail(format_args!(
-                "a host command list did not close ({e}): a command recorded into it was invalid"
+                "a host command list did not close ({e}): a command recorded into it was invalid{detail}"
             ));
         }
     }
