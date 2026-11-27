@@ -2636,6 +2636,44 @@ impl<'a> Lower<'a> {
         self.s.m.select(c, keep, r, t)
     }
 
+    /// Signed byte dot product, with a wrapping accumulator. Some host drivers
+    /// treat constant packed operands as unsigned, despite DXIL opcode 163.
+    /// Expand those products; keep the intrinsic for two runtime operands.
+    fn dot4_i8(&mut self, a: V, b: V, mut acc: V) -> V {
+        let c = self.cur;
+        let constant = self
+            .s
+            .m
+            .int_value(b)
+            .map(|x| (a, x as u32))
+            .or_else(|| self.s.m.int_value(a).map(|x| (b, x as u32)));
+        if let Some((x, packed)) = constant {
+            for k in 0..4 {
+                let byte = (packed >> (8 * k)) as i8 as i32;
+                if byte == 0 {
+                    continue;
+                }
+                let left = self.s.m.i32(24 - 8 * k);
+                let right = self.s.m.i32(24);
+                let shifted = self.s.m.bin(c, Bin::Shl, x, left);
+                let signed = self.s.m.bin(c, Bin::AShr, shifted, right);
+                let factor = self.s.m.i32(byte as u32);
+                let product = self.s.m.bin(c, Bin::Mul, signed, factor);
+                acc = self.s.m.bin(c, Bin::Add, acc, product);
+            }
+            acc
+        } else {
+            self.s.op(
+                c,
+                "dot4AddPacked.i32",
+                Attr::ReadNone,
+                self.s.t.i32,
+                163,
+                &[acc, a, b],
+            )
+        }
+    }
+
     /// The median of three. With a NaN among them the hardware gives the
     /// minimum of the three instead (the host's minimum skips NaNs, so that
     /// is the smallest number among them).
@@ -6265,15 +6303,7 @@ impl<'a> Lower<'a> {
                     return Err("an accumulator");
                 };
                 let acc = self.i32_of(inst.read(Reg::V(reg)).ok_or("an accumulator")?)?;
-                let i32_ty = self.s.t.i32;
-                let r = self.s.op(
-                    c,
-                    "dot4AddPacked.i32",
-                    Attr::ReadNone,
-                    i32_ty,
-                    163,
-                    &[acc, a, bb],
-                );
+                let r = self.dot4_i8(a, bb, acc);
                 int(self, r)
             }
             "v_dot4_i32_i8" => {
@@ -6291,6 +6321,13 @@ impl<'a> Lower<'a> {
                         xs.push(x);
                         continue;
                     }
+                    if let Some(bits) = self.s.m.int_value(x) {
+                        let bits = bits as u32;
+                        let low = (bits >> if lo { 16 } else { 0 }) & 0xFFFF;
+                        let high = (bits >> if hi { 16 } else { 0 }) & 0xFFFF;
+                        xs.push(self.s.m.i32(low | high << 16));
+                        continue;
+                    }
                     let (k16, low) = (self.s.m.i32(16), self.s.m.i32(0xFFFF));
                     let top = self.s.m.bin(c, Bin::LShr, x, k16);
                     let bottom = self.s.m.bin(c, Bin::And, x, low);
@@ -6301,15 +6338,7 @@ impl<'a> Lower<'a> {
                     xs.push(self.s.m.bin(c, Bin::Or, if lo { top } else { bottom }, hi));
                 }
                 let acc = s(self, 2)?;
-                let i32_ty = self.s.t.i32;
-                let r = self.s.op(
-                    c,
-                    "dot4AddPacked.i32",
-                    Attr::ReadNone,
-                    i32_ty,
-                    163,
-                    &[acc, xs[0], xs[1]],
-                );
+                let r = self.dot4_i8(xs[0], xs[1], acc);
                 int(self, r)
             }
             "v_mov_b32" => {
