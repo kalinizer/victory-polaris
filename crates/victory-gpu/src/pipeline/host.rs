@@ -506,8 +506,7 @@ fn push_marks_params(params: &mut Vec<D3D12_ROOT_PARAMETER1>) -> (u32, u32) {
 
 /// Diagnostic: write a host pipeline's shader and root-signature bytes so a
 /// refused one can be compared byte-for-byte with one the same driver accepts.
-/// `VICTORY_DUMP_PSO_DXIL=1` (diagnostics builds only).
-#[cfg(feature = "diagnostics")]
+/// `VICTORY_DUMP_PSO_DXIL=1` (off by default).
 fn dump_pso_dxil(kind: &str, shaders: &[Arc<Shader>], code: &[u8], root: &[u8]) {
     use std::io::Write;
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1214,8 +1213,14 @@ fn root_signature(
     } else {
         D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT
     };
-    let heap_indexing = D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED
+    let mut heap_indexing = D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED
         | D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED;
+    // Experiment: static samplers plus directly-indexed sampler heaps may be
+    // the combination this adapter refuses at PSO creation. Drop only the
+    // sampler flag to isolate it (off by default).
+    if crate::switch::on("VICTORY_NO_SAMPLER_HEAP_FLAG") {
+        heap_indexing &= !D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED;
+    }
     let flags = input | heap_indexing;
     let desc_with = |flags| D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
         Version: windows::Win32::Graphics::Direct3D12::D3D_ROOT_SIGNATURE_VERSION_1_1,

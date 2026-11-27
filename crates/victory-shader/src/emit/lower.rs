@@ -89,6 +89,9 @@ pub(crate) struct Parts<'a> {
     pub emulate_mesh: bool,
     /// Writes through buffer views mark their pages (`emit`, "Write marks").
     pub view_marks: bool,
+    /// Emit wave64 even for console wave32 programs (hosts with a 64-lane
+    /// minimum wave reject a declared 32-lane wave at PSO creation).
+    pub wave64: bool,
 }
 
 enum Stop {
@@ -594,7 +597,7 @@ impl<'a> Lower<'a> {
                         .any(|a| matches!(a, Atom::Opaque(_) | Atom::Constant(_)))
                 })
             };
-            let wave = if x.native.wave64 { 64 } else { 32 };
+            let wave = if x.native.wave64 || x.wave64 { 64 } else { 32 };
             let one_wave = cs.threads.iter().product::<u32>() <= wave;
             if console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(wave);

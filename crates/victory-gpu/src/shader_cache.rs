@@ -88,12 +88,19 @@ pub fn host_shader(container: &[u8], mesh: MeshMode) -> (Result<HostShader, Stri
     let options = victory_shader::emit::Options {
         view_marks: true,
         mesh,
+        // A 64-lane-minimum device (Polaris/GCN4) refuses PSOs that declare
+        // wave32; emit those programs for wave64 instead (`host.rs`).
+        wave64: crate::host::Host::wave64_only(),
     };
     let translate =
         |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
-    let id = match mesh {
-        MeshMode::Native => "shader.dxil",
-        MeshMode::Emulate => "shader.dxil.mesh-emu",
+    // Options are not part of the cache key: keep wave32 and wave64 entries
+    // apart so a prebuild/translate pass cannot hand the run a wave32 shader.
+    let id = match (mesh, options.wave64) {
+        (MeshMode::Native, false) => "shader.dxil",
+        (MeshMode::Emulate, false) => "shader.dxil.mesh-emu",
+        (MeshMode::Native, true) => "shader.dxil.wave64",
+        (MeshMode::Emulate, true) => "shader.dxil.mesh-emu.wave64",
     };
     match CACHE.get() {
         Some(cache) => cached(cache, build(), id, container, translate),

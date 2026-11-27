@@ -782,6 +782,31 @@ impl Host {
         })
     }
 
+    /// Whether the device's minimum wave is 64 lanes. GCN4/Polaris reports
+    /// 64, and the D3D12 debug layer rejects any PSO whose shader declares a
+    /// 32-lane wave on such a device, so wave32 console shaders must be
+    /// re-emitted for wave64 before their host pipelines can be created.
+    pub(crate) fn wave64_only() -> bool {
+        static WAVE: OnceLock<bool> = OnceLock::new();
+        *WAVE.get_or_init(|| {
+            let Some(host) = host() else {
+                return false;
+            };
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+            let ok = unsafe {
+                host.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS1,
+                    (&raw mut options).cast(),
+                    size_of_val(&options) as u32,
+                )
+            }
+            .is_ok();
+            let min = options.WaveLaneCountMin;
+            tracing::info!(ok, min, "host wave support");
+            ok && min > 32
+        })
+    }
+
     /// Whether the host runs native mesh shaders at shader model 6.6; logged once.
     pub(crate) fn mesh_shaders(&self) -> bool {
         self.mesh_support() == MeshSupport::Native

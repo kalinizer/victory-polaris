@@ -366,6 +366,10 @@ pub struct Options {
     /// How mesh programs (`HwStage::Ms`) are translated (`MeshMode::Native`
     /// or `MeshMode::Emulate`).
     pub mesh: MeshMode,
+    /// Emit wave64 for console wave32 programs. Hosts whose minimum wave is
+    /// 64 (Polaris/GCN4) reject PSOs that declare a 32-lane wave, so those
+    /// shaders must be re-emitted for the host's wave instead.
+    pub wave64: bool,
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
@@ -492,6 +496,7 @@ pub fn emit_with(
         mesh_stride,
         emulate_mesh: native.stage == HwStage::Ms && options.mesh == MeshMode::Emulate,
         view_marks: options.view_marks,
+        wave64: options.wave64,
     };
     let l = match lower::lower(&parts(st, res)) {
         // Discarded lanes kept on as helpers can read what no surviving
