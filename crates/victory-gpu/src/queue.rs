@@ -297,23 +297,31 @@ extern "system" fn present(
             if plane.count == 0 || plane.resources.is_null() {
                 continue;
             }
-            // SAFETY: the plane lists `count` resources.
-            let resource = unsafe { *plane.resources };
+            // A PresentX plane can list more than one resource (a menu
+            // background and its text/icons, for example). The normal path
+            // shows the first, as upstream does; the opt-in path shows every
+            // resource as another compositor layer.
+            let all = crate::switch::on("VICTORY_PRESENT_ALL_RESOURCES");
+            let take = if all { plane.count.min(8) } else { 1 };
             #[cfg(feature = "diagnostics")]
             if crate::capture::wanted(frame) && crate::switch::on("VICTORY_LOG_PLANES") {
-                let d = crate::resource::host_resource(resource)
+                let d = crate::resource::host_resource(unsafe { *plane.resources })
                     .map(|texture| unsafe { texture.GetDesc() });
                 tracing::info!(
                     frame,
                     plane = i,
                     count = plane.count,
+                    shown = take,
                     width = d.as_ref().map(|d| d.Width),
                     height = d.as_ref().map(|d| d.Height),
                     format = d.as_ref().map(|d| d.Format.0),
                     "present plane"
                 );
             }
-            handles.push(resource);
+            // SAFETY: the plane lists `count` resources.
+            for n in 0..take {
+                handles.push(unsafe { *plane.resources.add(n as usize) });
+            }
         }
         // Opt-in diagnostic (VanviroDev): the title's first PresentX plane can
         // be a surface it never writes. Put the last draw target in its place
