@@ -184,6 +184,16 @@ fn mesh_draw_budget() -> u64 {
     })
 }
 
+/// Extra whole-device UAV flush between the emulated mesh compute shader and
+/// the unpack VS/draw (`VICTORY_MESH_UAV_BARRIER`, on by default). The scratch
+/// buffer's UAV-to-SRV transition already orders that one resource; some
+/// RDNA1 hosts still needed a wide barrier here. `0` restores the
+/// transition-only path.
+fn mesh_uav_barrier() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| crate::switch::on_by_default("VICTORY_MESH_UAV_BARRIER"))
+}
+
 /// This frame's budget use. Frames come from [`crate::frame::current`], so a
 /// new frame starts a fresh allowance even when the counter is never read at
 /// the exact instant the title begins its next frame.
@@ -2808,6 +2818,10 @@ impl State {
         unsafe {
             list.list
                 .ExecuteIndirect(&dispatch_sig, 1, &buffers.indirect_args, 0, None, 0);
+            if mesh_uav_barrier() {
+                // SAFETY: an open list; a UAV-wide barrier names no resource.
+                list.list.ResourceBarrier(&[crate::indirect::uav_barrier()]);
+            }
             list.list.ResourceBarrier(&[transition(
                 &buffers.output,
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,

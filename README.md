@@ -17,30 +17,31 @@ getting the dump to run on a machine the upstream project does not target:
 Everything below comes from actually running the game on that machine. It is
 not a claim about other hardware.
 
-## Status (2026-11-27)
+## Status (2026-11-28)
 
-**Not playable. The 3D world is still black.** The UI, menus, map, audio and
-the 2D presentation planes work, and the host submits tens of thousands of
-draws, but the rendered 3D scene has never appeared on screen on this machine.
+**Not playable yet, but the 3D world now draws instead of being solid black.**
+The user sees a blue sky/horizon, a dark blue ground and a small number of
+boxes where geometry should be; the pause menu is still a blurred gradient
+whose options can only be selected by sound. The remaining work is visible
+geometry and menu text, not getting the host to render at all.
 
 | Stage | Observed on this machine |
 |---|---|
 | Boot, first-boot screens, profile/save | works (needs scripted keys, see below) |
 | Intro cinematic audio, sound, music, ambience | works |
-| Money UI, phone message UI, map (CENTER / 2D VIEW / ADD MARKER / SET DESTINATION / EXIT) | works |
-| 2D presentation planes (splash, loading art, UI) | full color (were solid black before the compositor fix) |
-| **3D world / first mission's cinematic** | **black** — see the warning below |
-| World geometry submitted | confirmed: up to **17,285 draws/frame**, emulated mesh pipelines active |
-| Live gameplay frames | reached frame ~46,000 with ~5,900 draws/frame; black-frame warnings, very slow (~1 fps or worse) |
-| Memory | grows without bound in long sessions (see [Memory](#memory-the-last-open-problem)); a fix is committed but has not yet been verified in a full run |
+| 2D presentation planes (splash, loading art) | full color (were solid black before the compositor fix) |
+| 3D world | **partly renders**: sky and ground visible, most geometry missing (was entirely black) |
+| Menus / HUD text | blurred gradient; navigation works by sound |
+| World geometry submitted | up to ~2,700 draws/frame at gameplay, emulated mesh pipelines active |
+| Indirect mesh draws | ~4,000/frame were dropped by the per-frame budget before it was raised to 4096; the budget and bounded root-view sink pool are what keep the scene-load from OOM-ing |
+| Live gameplay | reached frame ~30,000+, ~1 fps (~1,000 ms/frame) — slow but stable in the best runs |
+| Memory | **stable in the surviving runs**: shadow windows 56/256, ~770 MiB shadow total; peak working set ~9–10 GB on 16 GB RAM. The 1 MiB root-view sinks, unlimited root-view refresh and mip-heavy host textures were the three OOM classes |
 
-> **Do not mistake the captures for the world.** `frame-17000.png`,
-> `frame-18000.png`, `frame-20000.png` and `frame-32768.png` are 1.4–2.5 MB
-> full-color images, but they show the **2D PresentX presentation plane** —
-> splash and loading art — composited by the fix below. A solid-black frame is
-> ~6,121 bytes at 1920×1080, so a large PNG proves that *something* was
-> presented; it does **not** prove that 3D geometry or the world shaders are
-> working. The user's own check confirms the 3D scene remains black.
+> The full frame captures in `polaris-loop-a/frame-30000-*.png` are individual
+> render targets (sky/fog planes), **not** a composited screenshot of the 3D
+> world. A large, non-black PNG proves that *something* was presented; it does
+> not prove that the world shaders are right. ongoing verification uses the
+> live window and the diagnostic counters in the frame-rate line.
 
 Translation counts from the diagnostic run:
 
@@ -341,6 +342,7 @@ Switches below are off when unset or `0`, unless the row says otherwise.
 | `VICTORY_MESH_BUFFER_MB=<n>` | intermediate buffer in MiB (`1..=1024`) |
 | `VICTORY_MESH_DRAW_BUDGET=<n>` | indirect mesh-emulation draws per frame (default **512**; `0` = unlimited). Skips are warned once per power of two, not once per draw; bounds per-draw argument copies, root views and PSO first-binds |
 | `VICTORY_MESH_POOL_MB=<n>` | hard cap on the whole global mesh-emulation buffer pool in MiB (`1..=1024`, default **128**). Clamps `VICTORY_MESH_BUFFER_MB` and the fallback ladder. The pool is made once and reused by every list after its submissions finish; no mesh draw allocates a buffer |
+| `VICTORY_MESH_UAV_BARRIER=0` | turn off the whole-device UAV flush between the emulated mesh CS and the unpack VS/draw (on by default; the scratch buffer's UAV→SRV transition is still recorded). `0` restores the transition-only path for the indirect mesh-emulation draw |
 | `VICTORY_PRESENT_LAST_TARGET` | substitute the frame's last draw target for PresentX plane 0 as the compositor's opaque base (opt-in experiment — **does not work on this tree**: the target is a 3840×2160 UI plane and the compositor produces an invalid command / `0x80004005`; keep off) |
 | `VICTORY_PRESENT_SUBRES` | single-plane present copies subresource 0 with `CopyTextureRegion` instead of `CopyResource` (upstream #3257 experiment) |
 | `VICTORY_ROOT_SIG_FALLBACK=1` | retry root signature serialization and creation without directly-indexed heap flags (0xC01/0xC00) if the host runtime rejects them; warns once with the flags and error (upstream #626 experiment) |
