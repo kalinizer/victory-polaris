@@ -139,6 +139,7 @@ fn lowered(native: &NativeProgram) -> Result<lower::Lowered, crate::ShaderError>
         mesh_stride: 0,
         emulate_mesh: false,
         view_marks: false,
+        wave64: false,
     })
 }
 

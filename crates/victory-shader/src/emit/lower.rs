@@ -11115,6 +11115,7 @@ mod tests {
             mesh_stride: 0,
             emulate_mesh: false,
             view_marks: false,
+            wave64: false,
         })
         .map(|_| ())
     }
@@ -11167,6 +11168,7 @@ mod tests {
             mesh_stride: 0,
             emulate_mesh: false,
             view_marks: false,
+            wave64: false,
         })
     }
 
@@ -11358,6 +11360,7 @@ mod tests {
             mesh_stride: 0,
             emulate_mesh: false,
             view_marks: false,
+            wave64: false,
         })
         .unwrap();
 

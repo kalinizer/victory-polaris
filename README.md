@@ -96,7 +96,16 @@ The UI survived because its shaders are simple. Fixes were ported from the
 ZJOU / naixue / unified / CCS03 forks and merged in `74dacbe`; a QA review
 caught a wrong 2-bit-per-lane selector in the `v_permlanex16` lowering, fixed
 in `36174f2` to the ISA's 4 bits per lane. The refusal count fell dramatically
-but the world is still black, so another cause remains.
+but the world was still black.
+
+The remaining refusals had a different cause, found by installing Windows'
+"Graphics Tools" capability and replaying a dumped PSO through the D3D12 debug
+layer: `Shader wants wave lane count of 32 but minimum wave lane count for
+device is 64`. GCN4/Polaris has a 64-lane minimum wave, so every console shader
+emitted with a declared 32-lane wave was rejected at PSO creation with
+`0x80070057`. `bd5cd0f` asks the device for `WaveLaneCountMin` and re-emits
+console wave32 programs for wave64 on such hosts; wave32 and wave64 cache
+entries are kept apart.
 
 **4. Two OOM classes had to be fixed separately.**
 

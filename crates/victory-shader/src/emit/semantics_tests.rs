@@ -294,6 +294,7 @@ fn lower_program(words: &[u32]) -> Result<HostShader, String> {
         mesh_stride: 0,
         emulate_mesh: false,
         view_marks: false,
+        wave64: false,
     })
     .map_err(e)?;
     Ok(HostShader {

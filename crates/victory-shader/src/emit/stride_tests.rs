@@ -195,6 +195,7 @@ fn build(
         mesh_stride: 0,
         emulate_mesh: false,
         view_marks: false,
+        wave64: false,
     })
     .expect("lower");
     let shader = HostShader {

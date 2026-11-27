@@ -181,6 +181,7 @@ fn program() -> HostShader {
         mesh_stride: 0,
         emulate_mesh: false,
         view_marks: false,
+        wave64: false,
     })
     .expect("lower");
     assert!(l.memory && l.memory_writes && l.view_addresses);
@@ -409,6 +410,7 @@ fn root_views_read_their_copy_and_zeros_past_it() {
         mesh_stride: 0,
         emulate_mesh: false,
         view_marks: false,
+        wave64: false,
     })
     .expect("lower");
     assert!(l.root_srvs.is_empty() && !l.memory, "no root descriptor, no title memory");
@@ -553,6 +555,7 @@ fn writes_through_views_mark_their_pages() {
         mesh_stride: 0,
         emulate_mesh: false,
         view_marks: true,
+        wave64: false,
     })
     .expect("lower");
     assert!(l.view_marks && !l.memory, "marks without the page table");
