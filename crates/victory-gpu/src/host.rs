@@ -3117,11 +3117,19 @@ impl Host {
             planes
         };
         let (mut width, mut height) = (primary_desc.Width as u32, primary_desc.Height);
-        for &(tex, _) in &planes[1..] {
-            // SAFETY: live resource.
-            let d = unsafe { tex.GetDesc() };
-            width = width.max(d.Width as u32);
-            height = height.max(d.Height);
+        // The console composes every plane to the base plane's size. Using
+        // the largest plane here scales the 1080p scene up to 4K and then
+        // lets the window scale it down again, which blurs the 4K UI. The
+        // fork's known-good path uses the base size and lets the compositor
+        // sample the UI plane down once (`VICTORY_PRESENT_BASE_SIZE=1`).
+        let base_size = crate::switch::on("VICTORY_PRESENT_BASE_SIZE");
+        if !base_size {
+            for &(tex, _) in &planes[1..] {
+                // SAFETY: live resource.
+                let d = unsafe { tex.GetDesc() };
+                width = width.max(d.Width as u32);
+                height = height.max(d.Height);
+            }
         }
         if presenter.is_none() {
             *presenter = match retry

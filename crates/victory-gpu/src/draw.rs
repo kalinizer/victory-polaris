@@ -1158,11 +1158,11 @@ impl State {
         self.probe_written(list);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         if self.ambient(list, p) {
-            // Our pass set its own heap, root signature and pipeline: the
-            // next draw or dispatch sets the title's again (as `replay`).
-            self.host_pipeline = 0;
-            self.host_roots = [0; 2];
-            self.host_heaps = [0; 2];
+            // Our pass set its own root signature and pipeline. Clear all
+            // cached host state so the next title draw binds its heaps, root
+            // signature and pipeline again, even if it sets no heaps of its
+            // own (with the fallback on, `host_heaps_set` must be cleared too).
+            self.host_state_lost();
         }
     }
 
@@ -1475,6 +1475,7 @@ impl State {
             emu.cs_marks,
             true,
         ) {
+            once!(name = %p.name, "mesh-emu CS: bind_pipeline failed");
             return false;
         }
         if !self.bind_stage(
@@ -1487,6 +1488,7 @@ impl State {
             false,
             true,
         ) {
+            once!(name = %p.name, "mesh-emu CS: bind_stage failed");
             return false;
         }
         #[cfg(feature = "diagnostics")]
