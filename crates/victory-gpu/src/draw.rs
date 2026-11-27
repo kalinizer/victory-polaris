@@ -808,14 +808,20 @@ impl State {
                         };
                         match offset {
                             Some(offset) => offset,
-                            None => return false,
+                            None => {
+                                once!(name = %name, "bind_stage failed: ROOT_VIEW_OFFSET without shadow");
+                                return false;
+                            }
                         }
                     }
                     None if is_root_view(u) => {
                         let uav = u.dword == victory_shader::emit::ROOT_UAV_VIEW;
                         match self.root_view(list, title_compute, u.slot, uav) {
                             Some((slot, _)) => slot,
-                            None => return false,
+                            None => {
+                                once!(name = %name, "bind_stage failed: root_view has no host copy");
+                                return false;
+                            }
                         }
                     }
                     None => self.user_value(title_compute, u.slot, u.root, u.dword),
