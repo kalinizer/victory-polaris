@@ -1533,8 +1533,18 @@ impl HostList {
         // SAFETY: our list.
         if let Err(e) = unsafe { self.list.Close() } {
             let detail = host().and_then(|h| h.log_messages()).unwrap_or_default();
+            #[cfg(feature = "diagnostics")]
+            let last = {
+                let notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
+                notes
+                    .last()
+                    .map(|(op, _)| format!("; last op: {op}"))
+                    .unwrap_or_default()
+            };
+            #[cfg(not(feature = "diagnostics"))]
+            let last = String::new();
             fail(format_args!(
-                "a host command list did not close ({e}): a command recorded into it was invalid{detail}"
+                "a host command list did not close ({e}): a command recorded into it was invalid{detail}{last}"
             ));
         }
     }
