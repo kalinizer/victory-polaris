@@ -1068,6 +1068,15 @@ impl Shader {
         if self.flags & flags::ATOMIC64_HEAP != 0 {
             features |= 0x1000_0000;
         }
+        // Experiment: the RX 560 XT refuses PSOs whose SFI0 declares sampler
+        // heap / INT64 / wave ops far more often than ones without. Clear a
+        // gated bitmask to see which declaration the host validator rejects.
+        // `VICTORY_SFI0_CLEAR=<hex>` (diagnostics experiments; off by default).
+        if let Ok(clear) = std::env::var("VICTORY_SFI0_CLEAR")
+            && let Ok(mask) = u64::from_str_radix(clear.trim().trim_start_matches("0x"), 16)
+        {
+            features &= !mask;
+        }
         let sfi0 = features.to_le_bytes();
         let isg1 = container::signature(&self.inputs, true);
         let osg1 = container::signature(&self.outputs, false);

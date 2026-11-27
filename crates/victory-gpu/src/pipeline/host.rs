@@ -504,6 +504,32 @@ fn push_marks_params(params: &mut Vec<D3D12_ROOT_PARAMETER1>) -> (u32, u32) {
     (first, first + 1)
 }
 
+/// Diagnostic: write a host pipeline's shader and root-signature bytes so a
+/// refused one can be compared byte-for-byte with one the same driver accepts.
+/// `VICTORY_DUMP_PSO_DXIL=1` (diagnostics builds only).
+#[cfg(feature = "diagnostics")]
+fn dump_pso_dxil(kind: &str, shaders: &[Arc<Shader>], code: &[u8], root: &[u8]) {
+    use std::io::Write;
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| crate::switch::on("VICTORY_DUMP_PSO_DXIL")) {
+        return;
+    }
+    let dir = std::env::var_os("VICTORY_CAPTURE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("pso-dxil");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let tag = shaders
+        .first()
+        .map(|s| s.hash.as_str())
+        .unwrap_or("unknown");
+    let stem = dir.join(format!("{tag}-{kind}"));
+    let _ = std::fs::File::create(stem.with_extension("dxil")).and_then(|mut f| f.write_all(code));
+    let _ = std::fs::File::create(stem.with_extension("root")).and_then(|mut f| f.write_all(root));
+}
+
 /// Logs a pipeline that gets no host pipeline, once per reason.
 fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline> {
     static SEEN: std::sync::Mutex<Vec<&str>> = std::sync::Mutex::new(Vec::new());
@@ -653,8 +679,12 @@ impl HostPipeline {
                 || unsafe { host.device.CreateComputePipelineState(&desc) },
             );
             let pso = match made {
-                Ok(pso) => pso,
+                Ok(pso) => {
+                    dump_pso_dxil("compute-ok", shaders, &code_bytes(&code(0)), &root_blob);
+                    pso
+                }
                 Err(e) => {
+                    dump_pso_dxil("compute-refused", shaders, &code_bytes(&code(0)), &root_blob);
                     tracing::warn!(error = %e, ?shaders, "host pipeline refused (compute)");
                     host.log_messages();
                     return None;
