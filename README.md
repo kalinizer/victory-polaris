@@ -339,6 +339,8 @@ Switches below are off when unset or `0`, unless the row says otherwise.
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | cap translated loop iterations per lane (own cache entries) |
 | `VICTORY_MESH_EMULATION=1\|0` | force or disable compute+vertex mesh emulation |
 | `VICTORY_MESH_BUFFER_MB=<n>` | intermediate buffer in MiB (`1..=1024`) |
+| `VICTORY_MESH_DRAW_BUDGET=<n>` | indirect mesh-emulation draws per frame (default **512**; `0` = unlimited). Skips are warned once per power of two, not once per draw; bounds per-draw argument copies, root views and PSO first-binds |
+| `VICTORY_MESH_POOL_MB=<n>` | hard cap on the whole global mesh-emulation buffer pool in MiB (`1..=1024`, default **128**). Clamps `VICTORY_MESH_BUFFER_MB` and the fallback ladder. The pool is made once and reused by every list after its submissions finish; no mesh draw allocates a buffer |
 | `VICTORY_PRESENT_LAST_TARGET` | substitute the frame's last draw target for PresentX plane 0 as the compositor's opaque base (opt-in experiment — **does not work on this tree**: the target is a 3840×2160 UI plane and the compositor produces an invalid command / `0x80004005`; keep off) |
 | `VICTORY_PRESENT_SUBRES` | single-plane present copies subresource 0 with `CopyTextureRegion` instead of `CopyResource` (upstream #3257 experiment) |
 | `VICTORY_ROOT_SIG_FALLBACK=1` | retry root signature serialization and creation without directly-indexed heap flags (0xC01/0xC00) if the host runtime rejects them; warns once with the flags and error (upstream #626 experiment) |
@@ -359,6 +361,7 @@ Switches below are off when unset or `0`, unless the row says otherwise.
 | `VICTORY_IDLE_FRAMES=<n>` | ticks without a use before a window goes when there is no pressure (default 2; was 4) |
 | `VICTORY_ROOT_VIEW_WINDOWS=<n>` | hard ceiling on live loose root-view windows, with oldest-used eviction (default 256) |
 | `VICTORY_ROOT_VIEW_MB=<n>` | cap on the bytes refreshed per root view (default **1** MiB). `0` explicitly means unlimited (refresh to the copy's end): risky here — it made ~1000 root views/frame copy ~1.3 GB/frame and fail with `0x8007000E`. A positive value larger than 1 may be needed if a shader's data sits past the first MiB |
+| `VICTORY_ROOT_VIEW_SINK_MB=<n>` | hard cap on the pooled 1 MiB filled buffers used for root SRV/UAV views with no host copy (default **64** MiB, at most 64 sinks/frame; CBVs use 64 KiB upload scratch and never enter the pool). `0` disables sinks and always binds a null raw view. Without this cap ~5000 refusals/frame each kept a fresh 1 MiB buffer until list reset, exhausting commit at scene load (`0x8007000E`) |
 | `VICTORY_RENDER_SCALE=<factor>` | shrink the **swap chain** only (`0.5`, `0.75`; `1`/unset keeps the title's size). The title still renders into its own targets, so this saves swap-chain memory and sampling work, **not** the 7+ GB of host textures. A scaled single plane goes through the sampling compositor instead of `CopyResource` |
 | `VICTORY_TEXTURE_MAX=<pixels>` | cap a sampled host texture's largest side by leaving out its top mips (power-of-two 2D sampled textures only; never below 256 px). `auto` = 1024, dropping to 512 above 92% and 256 above 97% of the card's DXGI budget. Unset: title sizes unchanged. The largest memory win |
 | `VICTORY_TEXTURE_MB=<n>` | per-texture host allocation budget in MiB, clamped to VRAM/4 (the small-VRAM preset rule). Top mips are left out until the estimated allocation fits; combines with `VICTORY_TEXTURE_MAX`. Unset: no byte budget |
@@ -381,7 +384,21 @@ $env:VICTORY_RENDER_SCALE        = '0.75'   # or 0.5; swap chain only
 $env:VICTORY_ROOT_VIEW_MB        = '1'      # default now; 0 = unlimited, do not use here
 $env:VICTORY_ROOT_VIEW_WINDOWS   = '256'    # default; loose windows are 1-2 MiB now
 $env:VICTORY_IDLE_FRAMES         = '2'      # default; 1 is more aggressive
+$env:VICTORY_MESH_DRAW_BUDGET    = '512'    # 256 if working set still climbs; 0 = unlimited (do not use here)
+$env:VICTORY_MESH_POOL_MB        = '64'     # hard ceiling on the global mesh pool (default 128)
+$env:VICTORY_MESH_BUFFER_MB      = '16'     # output scratch inside that ceiling
+$env:VICTORY_ROOT_VIEW_SINK_MB   = '64'     # 0 = never allocate a no-copy root-view sink
 ```
+
+The mesh budget is what keeps the recovered ~4000 indirect draws/frame from
+turning into an allocation failure at scene load: it renders far more geometry
+than the old dropped-draw baseline while the number of argument copies, root
+views and PSO first-binds per frame stays bounded. On 16 GB RAM / 8 GB VRAM,
+start with `VICTORY_MESH_DRAW_BUDGET=512` and `VICTORY_MESH_POOL_MB=64`; if the
+working set still grows, drop the budget to 256 and the pool to 32 before
+touching the paging file. A diagnostics build logs the executed/skipped mesh
+draws and the sinks created/reused/nulled once a frame
+(`indirect mesh-emu draws and root-view sinks this frame`).
 
 The root-view refresh cap is the single biggest CPU/memory lever: with
 `VICTORY_ROOT_VIEW_MB=0` (the former unlimited default) the crashed run copied

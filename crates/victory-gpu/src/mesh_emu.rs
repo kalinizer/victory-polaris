@@ -26,7 +26,19 @@ use crate::indirect::uav_barrier;
 
 const SLOT_MAP_BYTES: u64 = 65_536 * 4;
 const INDIRECT_ARGS_BYTES: u64 = 256;
+/// The dummy SRV the indirect path binds when a draw has no slot map.
+const DUMMY_SRV_BYTES: u64 = 256;
+/// Every buffer except `output`, which is the only sizeable one.
+const FIXED_BYTES: u64 = SLOT_MAP_BYTES + INDIRECT_ARGS_BYTES + DUMMY_SRV_BYTES;
 const OUTPUT_FALLBACK_SIZES: &[u64] = &[128 << 20, 64 << 20, 32 << 20, 16 << 20];
+
+/// Hard cap on the whole global mesh-emulation pool (`VICTORY_MESH_POOL_MB`).
+/// The other buffers are small and fixed; the cap therefore bounds `output`,
+/// which is otherwise tried at 128 MiB before falling back. PR #961's shared
+/// Data allocator cut retained mesh storage from 1947 to 95 MiB on this
+/// workload; an explicit ceiling keeps the ceiling even if a later change
+/// asks for a bigger scratch buffer.
+const DEFAULT_POOL_MB: u64 = 128;
 
 const PREP_SOURCE: &str = r#"
 #define RS "RootConstants(num32BitConstants=6, b0), UAV(u0), UAV(u1), UAV(u2), UAV(u3)"
@@ -87,6 +99,10 @@ unsafe impl Send for Buffers {}
 // SAFETY: as above.
 unsafe impl Sync for Buffers {}
 
+/// One global pool, made on first use and never reallocated. Lists borrow it
+/// with `list.keep`: those references are dropped only after that list's
+/// submissions have been waited for (`HostList::reset`), so reuse is already
+/// fence-aware and no mesh draw allocates a buffer of its own.
 pub(crate) fn buffers() -> Option<&'static Buffers> {
     static BUFFERS: OnceLock<Option<Buffers>> = OnceLock::new();
     BUFFERS
@@ -98,6 +114,34 @@ pub(crate) fn buffers() -> Option<&'static Buffers> {
             }
         })
         .as_ref()
+}
+
+/// Parses the pool cap; a bad value falls back with a warning. Separate from
+/// [`pool_cap_bytes`] so the parsing can be tested without touching the env.
+fn parse_pool_mb(raw: Option<&str>) -> u64 {
+    match raw.map(str::trim) {
+        None | Some("") => DEFAULT_POOL_MB,
+        Some(value) => match value.parse::<u64>() {
+            Ok(mb) if (1..=1024).contains(&mb) => mb,
+            _ => {
+                tracing::warn!(value, "VICTORY_MESH_POOL_MB invalid; using the default");
+                DEFAULT_POOL_MB
+            }
+        },
+    }
+}
+
+fn pool_cap_bytes() -> u64 {
+    static CAP: OnceLock<u64> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        let raw = std::env::var("VICTORY_MESH_POOL_MB").ok();
+        parse_pool_mb(raw.as_deref()) << 20
+    })
+}
+
+/// Largest `output` that still leaves room for the fixed pool buffers.
+fn output_cap_bytes() -> u64 {
+    pool_cap_bytes().saturating_sub(FIXED_BYTES).max(4096)
 }
 
 fn configured_output_bytes() -> Option<u64> {
@@ -114,13 +158,35 @@ fn configured_output_bytes() -> Option<u64> {
     }
 }
 
+/// Sizes to try for `output`, largest first, each bounded by the pool cap
+/// and deduplicated so a tight cap does not retry the same allocation.
+fn output_candidates(requested: Option<u64>, cap: u64) -> Vec<u64> {
+    let mut sizes: Vec<u64> = requested
+        .into_iter()
+        .chain(OUTPUT_FALLBACK_SIZES.iter().copied())
+        .map(|bytes| bytes.min(cap))
+        .collect();
+    sizes.dedup();
+    sizes
+}
+
 fn allocate_output(host: &Host) -> Option<(ID3D12Resource, u64)> {
-    if let Some(bytes) = configured_output_bytes()
-        && let Some(buf) = host.unordered_buffer(bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
+    let requested = configured_output_bytes();
+    let cap = output_cap_bytes();
+    if let Some(bytes) = requested
+        && bytes > cap
     {
-        return Some((buf, bytes));
+        static CLAMPED: std::sync::Once = std::sync::Once::new();
+        CLAMPED.call_once(|| {
+            tracing::warn!(
+                requested_mb = bytes >> 20,
+                cap_mb = cap >> 20,
+                "VICTORY_MESH_BUFFER_MB clamped by VICTORY_MESH_POOL_MB"
+            );
+        });
     }
-    for &bytes in OUTPUT_FALLBACK_SIZES {
+    for bytes in output_candidates(requested, cap) {
+        // SAFETY: `bytes` is a positive, capped buffer size.
         if let Some(buf) = host.unordered_buffer(bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
         {
             return Some((buf, bytes));
@@ -190,9 +256,9 @@ fn make() -> Option<Buffers> {
         INDIRECT_ARGS_BYTES,
         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
     )?;
-    let (dummy_srv, dummy_ptr) = host.upload_buffer(256)?;
-    // SAFETY: `dummy_ptr` points to 256 zeroed bytes of a live upload buffer.
-    unsafe { std::ptr::write_bytes(dummy_ptr, 0, 256) };
+    let (dummy_srv, dummy_ptr) = host.upload_buffer(DUMMY_SRV_BYTES)?;
+    // SAFETY: `dummy_ptr` points to `DUMMY_SRV_BYTES` zeroed bytes of a live upload buffer.
+    unsafe { std::ptr::write_bytes(dummy_ptr, 0, DUMMY_SRV_BYTES as usize) };
     let (prep_root, prep_pso) = compile_prep(&host.device)
         .inspect_err(|e| tracing::warn!(error = %e, "mesh_indirect_prep pipeline failed"))
         .ok()?;
@@ -211,7 +277,8 @@ fn make() -> Option<Buffers> {
     };
     tracing::info!(
         output_mb = output_bytes >> 20,
-        "mesh shader emulation buffers ready"
+        pool_cap_mb = pool_cap_bytes() >> 20,
+        "mesh shader emulation buffers ready (one global pool, reused every frame)"
     );
     Some(Buffers {
         output,
@@ -294,6 +361,20 @@ impl Buffers {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pool_cap_bounds_the_output_sizes() {
+        assert_eq!(parse_pool_mb(None), 128);
+        assert_eq!(parse_pool_mb(Some(" 64 ")), 64);
+        assert_eq!(parse_pool_mb(Some("0")), 128); // out of 1..=1024
+        assert_eq!(parse_pool_mb(Some("99999")), 128);
+        let cap = 64 << 20;
+        assert!(cap > FIXED_BYTES);
+        let sizes = output_candidates(Some(128 << 20), cap);
+        assert_eq!(sizes, vec![cap, 32 << 20, 16 << 20]); // largest clamped, rest unchanged
+        assert!(sizes.iter().all(|&size| size <= cap));
+        assert_eq!(output_candidates(Some(8 << 20), 64 << 20)[0], 8 << 20);
+    }
 
     #[test]
     fn prep_shader_builds_and_runs_indirect() {

@@ -150,6 +150,267 @@ pub(crate) fn drawn() -> u64 {
     DRAWN.load(Ordering::Relaxed)
 }
 
+/// Indirect mesh-emulation draws allowed per frame (`VICTORY_MESH_DRAW_BUDGET`;
+/// `0` is unlimited). Recovering all ~4000 previously dropped indirect draws
+/// made every frame copy arguments, refresh root views and first-bind PSOs;
+/// the scene-load transition then exhausted commit (`0x8007000E` even for a
+/// 256-byte `shared_buffer`). A bound keeps far more geometry than the old
+/// dropped-draw baseline while the per-draw host work stays finite.
+const DEFAULT_MESH_DRAW_BUDGET: u64 = 512;
+
+/// Parses the budget; a bad value falls back with a warning. Kept separate
+/// from [`mesh_draw_budget`] so it can be tested without touching the env.
+fn parse_mesh_draw_budget(raw: Option<&str>) -> u64 {
+    match raw.map(str::trim) {
+        None | Some("") => DEFAULT_MESH_DRAW_BUDGET,
+        Some(value) => match value.parse::<u64>() {
+            Ok(n) => n,
+            Err(_) => {
+                tracing::warn!(
+                    value,
+                    "VICTORY_MESH_DRAW_BUDGET invalid; using the default"
+                );
+                DEFAULT_MESH_DRAW_BUDGET
+            }
+        },
+    }
+}
+
+fn mesh_draw_budget() -> u64 {
+    static BUDGET: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        let raw = std::env::var("VICTORY_MESH_DRAW_BUDGET").ok();
+        parse_mesh_draw_budget(raw.as_deref())
+    })
+}
+
+/// This frame's budget use. Frames come from [`crate::frame::current`], so a
+/// new frame starts a fresh allowance even when the counter is never read at
+/// the exact instant the title begins its next frame.
+#[derive(Default)]
+struct MeshBudget {
+    frame: u64,
+    executed: u64,
+    skipped: u64,
+}
+
+impl MeshBudget {
+    /// One attempt: `true` to run the draw, `false` to skip it once the
+    /// budget is spent. Skips are warned once per power of two, not once per
+    /// draw, so a frame of thousands of skips says a few lines at most.
+    fn take(&mut self, frame: u64, budget: u64) -> bool {
+        if self.frame != frame {
+            #[cfg(feature = "diagnostics")]
+            if self.frame != 0 && (self.executed != 0 || self.skipped != 0) {
+                let (created, reused, nulled) = sink_counts(self.frame);
+                tracing::debug!(
+                    frame = self.frame,
+                    executed = self.executed,
+                    skipped = self.skipped,
+                    sinks_created = created,
+                    sinks_reused = reused,
+                    sinks_nulled = nulled,
+                    "indirect mesh-emu draws and root-view sinks this frame"
+                );
+            }
+            *self = Self {
+                frame,
+                ..Self::default()
+            };
+        }
+        if budget == 0 || self.executed < budget {
+            self.executed += 1;
+            return true;
+        }
+        self.skipped += 1;
+        if self.skipped.is_power_of_two() {
+            tracing::warn!(
+                frame,
+                budget,
+                skipped = self.skipped,
+                "indirect mesh-emu draws skipped: per-frame budget reached"
+            );
+        }
+        false
+    }
+}
+
+static MESH_BUDGET: std::sync::Mutex<MeshBudget> = std::sync::Mutex::new(MeshBudget {
+    frame: 0,
+    executed: 0,
+    skipped: 0,
+});
+
+/// Accounts one indirect mesh-emu draw against this frame's budget.
+fn mesh_draw_slot() -> bool {
+    let frame = crate::frame::current();
+    let budget = mesh_draw_budget();
+    let mut state = MESH_BUDGET.lock().unwrap_or_else(|e| e.into_inner());
+    state.take(frame, budget)
+}
+
+/// A bounded pool of filled buffers standing in for root views whose title
+/// memory has no host copy (`VICTORY_ROOT_VIEW_SINK_MB`). Before this, each
+/// refusal allocated its own 1 MiB `shared_buffer`, held by the list until
+/// reset: ~5000 refusals a frame during scene load exhausted commit with
+/// `0x8007000E` (even a 256-byte allocation failed). The first hard error was
+/// `prelude()`'s allocator/list creation hitting the same wall. Sinks are
+/// keyed by (address, size) and reused by later lists in the same frame; once
+/// the cap is spent we bind the null raw view the fallback already has.
+struct Sink {
+    address: u64,
+    bytes: u64,
+    buffer: ID3D12Resource,
+    data: *mut u8,
+}
+
+// SAFETY: D3D12 resources and their mapped pointers are free-threaded; the
+// pool is behind a mutex and an entry is cloned (COM refcount) before use.
+unsafe impl Send for Sink {}
+unsafe impl Sync for Sink {}
+
+#[derive(Default)]
+struct SinkPool {
+    sinks: Vec<Sink>,
+    bytes: u64,
+    frame: u64,
+}
+
+/// At most this many sinks per frame. With 1 MiB SRV/UAV sinks this is also
+/// the 64 MiB default byte cap; the byte cap still applies to larger values.
+const MAX_SINKS: usize = 64;
+const DEFAULT_SINK_MB: u64 = 64;
+
+/// Parses the sink cap; `0` disables sinks (always a null view). Kept separate
+/// from [`sink_cap_bytes`] so parsing can be tested without touching the env.
+fn parse_sink_mb(raw: Option<&str>) -> u64 {
+    match raw.map(str::trim) {
+        None | Some("") => DEFAULT_SINK_MB,
+        Some(value) => match value.parse::<u64>() {
+            Ok(mb) if mb <= 1024 => mb,
+            _ => {
+                tracing::warn!(value, "VICTORY_ROOT_VIEW_SINK_MB invalid; using the default");
+                DEFAULT_SINK_MB
+            }
+        },
+    }
+}
+
+fn sink_cap_bytes() -> u64 {
+    static CAP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        let raw = std::env::var("VICTORY_ROOT_VIEW_SINK_MB").ok();
+        parse_sink_mb(raw.as_deref()) << 20
+    })
+}
+
+/// This pool only serves root SRV/UAV views: a shader's vertex streams can
+/// sit past the first 64 KiB, so sinks stay 1 MiB unless the operator has
+/// explicitly asked for a smaller `VICTORY_ROOT_VIEW_MB`. CBVs with no host
+/// copy never reach it — they use the 64 KiB upload scratch in [`root_view`].
+fn sink_bytes(_uav: bool) -> u64 {
+    root_view_limit().min(1 << 20)
+}
+
+static SINKS: std::sync::Mutex<SinkPool> = std::sync::Mutex::new(SinkPool {
+    sinks: Vec::new(),
+    bytes: 0,
+    frame: u64::MAX,
+});
+static SINKS_CREATED: AtomicU64 = AtomicU64::new(0);
+static SINKS_REUSED: AtomicU64 = AtomicU64::new(0);
+static SINKS_NULLED: AtomicU64 = AtomicU64::new(0);
+
+/// The pool for `frame`, dropping entries from earlier frames. Every host
+/// submission is waited for before the next one (`HostList::reset`), so a
+/// sink recorded in an earlier frame is no longer read by the GPU; the list
+/// and view heap still hold their own references until they are reset.
+fn sink_pool(frame: u64) -> std::sync::MutexGuard<'static, SinkPool> {
+    let mut pool = SINKS.lock().unwrap_or_else(|e| e.into_inner());
+    if pool.frame != frame {
+        pool.sinks.clear();
+        pool.bytes = 0;
+        pool.frame = frame;
+        SINKS_CREATED.store(0, Ordering::Relaxed);
+        SINKS_REUSED.store(0, Ordering::Relaxed);
+        SINKS_NULLED.store(0, Ordering::Relaxed);
+    }
+    pool
+}
+
+/// Counts a null-view fallback, warning once per power of two rather than
+/// once per root view.
+fn null_sink(frame: u64, address: u64, bytes: u64) {
+    let n = SINKS_NULLED.fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        tracing::warn!(
+            frame,
+            address,
+            bytes,
+            nulled = n,
+            "root-view sink pool spent: binding a null raw view"
+        );
+    }
+}
+
+/// Borrows a sink for `address`, allocating one only while the pool has room.
+/// Returns a clone of the resource so the caller can keep it on its list and
+/// make the view; the pool owns the original until the frame rolls over.
+fn sink(frame: u64, address: u64, bytes: u64) -> Option<(ID3D12Resource, *mut u8)> {
+    let cap = sink_cap_bytes();
+    if cap == 0 {
+        null_sink(frame, address, bytes);
+        return None;
+    }
+    let mut pool = sink_pool(frame);
+    if let Some(entry) = pool
+        .sinks
+        .iter()
+        .find(|s| s.address == address && s.bytes == bytes)
+    {
+        SINKS_REUSED.fetch_add(1, Ordering::Relaxed);
+        return Some((entry.buffer.clone(), entry.data));
+    }
+    if pool.sinks.len() >= MAX_SINKS || pool.bytes.saturating_add(bytes) > cap {
+        drop(pool);
+        null_sink(frame, address, bytes);
+        return None;
+    }
+    let Some((buffer, data)) = crate::host::host().and_then(|h| h.shared_buffer(bytes)) else {
+        drop(pool);
+        null_sink(frame, address, bytes);
+        return None;
+    };
+    pool.sinks.push(Sink {
+        address,
+        bytes,
+        buffer: buffer.clone(),
+        data,
+    });
+    pool.bytes += bytes;
+    SINKS_CREATED.fetch_add(1, Ordering::Relaxed);
+    Some((buffer, data))
+}
+
+/// Sinks created, reused and nulled in `frame`, for the frame diagnostics
+/// line. Reading the counts also rolls the pool over if no sink was asked for
+/// since the frame began.
+#[cfg(feature = "diagnostics")]
+fn sink_counts(frame: u64) -> (u64, u64, u64) {
+    drop(sink_pool(frame));
+    (
+        SINKS_CREATED.load(Ordering::Relaxed),
+        SINKS_REUSED.load(Ordering::Relaxed),
+        SINKS_NULLED.load(Ordering::Relaxed),
+    )
+}
+
+#[cfg(not(feature = "diagnostics"))]
+#[allow(dead_code)]
+fn sink_counts(_frame: u64) -> (u64, u64, u64) {
+    (0, 0, 0)
+}
+
 /// The draws traced since the last present (diagnostics builds, with
 /// debug logging for this module): logged when the frame comes out black.
 #[cfg(feature = "diagnostics")]
@@ -1042,19 +1303,19 @@ impl State {
                 }
             }
             None => {
-                // No host copy: fill a small UAV-capable buffer from title
-                // memory at submission and view that, so the shader reads
-                // real data and a UAV write has somewhere safe to go (it is
-                // discarded rather than copied back). A null raw *buffer*
-                // view is the last resort; a texture null would be rejected
-                // by the debug layer. Neither drops the dispatch.
-                let bytes = (1 << 20) & !3;
-                match crate::host::host().and_then(|h| h.shared_buffer(bytes)) {
+                // No host copy: borrow a bounded sink from the pool and fill
+                // it at submission, so the shader reads real data and a UAV
+                // write has somewhere safe to go (it is discarded rather
+                // than copied back). Once the pool is spent, bind a null raw
+                // *buffer* view; a texture null would be rejected by the
+                // debug layer. Neither drops the dispatch.
+                let bytes = sink_bytes(uav);
+                match sink(crate::frame::current(), address, bytes) {
                     Some((buffer, data)) => {
                         list.keep(&buffer);
                         list.defer_fill(data, address as *const u8, bytes as usize);
                         host.raw_view_at(index, Some(&buffer), 0, bytes, uav);
-                        once!(slot, address, "a root view has no copy: using a filled sink view");
+                        once!(slot, address, "a root view has no copy: using a pooled sink view");
                     }
                     None => {
                         host.raw_view_at(index, None, 0, 0, uav);
@@ -2380,6 +2641,16 @@ impl State {
             why("count not 4-byte aligned");
             return false;
         }
+        // Budget before any argument copy, clamp, bind or emulation-buffer
+        // use: that is the per-draw work which exhausted commit. Nothing has
+        // been recorded yet, but mirror the failure paths below and restore
+        // state so no emulated binding or topology can leak into the next
+        // draw on this list.
+        if !mesh_draw_slot() {
+            self.restore_mesh_emu_state(list);
+            why("indirect mesh-emu per-frame budget");
+            return false;
+        }
         args.refresh(list, arguments, len);
         if let Some((s, at)) = counter {
             s.refresh(list, at, 4);
@@ -3554,5 +3825,39 @@ void main(uint3 id : SV_DispatchThreadID) {
         drop(found);
         slots.make_null(0);
         assert!(shown.upgrade().is_none(), "released with the slot");
+    }
+
+    /// The indirect mesh budget is per frame, and `0` leaves it unlimited.
+    #[test]
+    fn mesh_draw_budget_is_per_frame() {
+        assert_eq!(parse_mesh_draw_budget(None), 512);
+        assert_eq!(parse_mesh_draw_budget(Some(" 0 ")), 0);
+        assert_eq!(parse_mesh_draw_budget(Some("17")), 17);
+        assert_eq!(parse_mesh_draw_budget(Some("not a number")), 512);
+
+        let mut state = MeshBudget::default();
+        for _ in 0..3 {
+            assert!(state.take(7, 3), "the first draws of a frame run");
+        }
+        assert!(!state.take(7, 3), "draws past the budget are skipped");
+        assert!(!state.take(7, 3));
+        assert_eq!((state.executed, state.skipped), (3, 2));
+        assert!(state.take(8, 3), "the next frame starts fresh");
+        assert_eq!((state.executed, state.skipped), (1, 0));
+        for _ in 0..10 {
+            assert!(state.take(8, 0), "0 means unlimited");
+        }
+        assert_eq!(state.executed, 11);
+    }
+
+    /// Root-view sinks are capped and can be turned off entirely.
+    #[test]
+    fn root_view_sink_cap_and_sizes() {
+        assert_eq!(parse_sink_mb(None), 64);
+        assert_eq!(parse_sink_mb(Some(" 0 ")), 0);
+        assert_eq!(parse_sink_mb(Some("128")), 128);
+        assert_eq!(parse_sink_mb(Some("not a number")), 64);
+        assert_eq!(sink_bytes(false), 1 << 20);
+        assert_eq!(sink_bytes(true), 1 << 20);
     }
 }
