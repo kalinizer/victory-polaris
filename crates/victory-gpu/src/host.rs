@@ -503,6 +503,10 @@ pub(crate) struct HostList {
     /// list names alive until it is reset, even if the title releases the
     /// resource first.
     states: Mutex<States>,
+    /// States assumed for loose host buffers (title-memory shadows) the list
+    /// uses as vertex/index buffers, by host resource pointer. These are not
+    /// host textures, so `states` cannot track them.
+    buffer_states: Mutex<std::collections::HashMap<usize, u32>>,
     /// Depth textures with a writable twin the list uses (`crate::twin`),
     /// by host copy: the side its first use needs and the side it leaves
     /// newer.
@@ -881,6 +885,7 @@ impl Host {
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
+                buffer_states: Mutex::default(),
                 twins: Mutex::default(),
                 rebind: false.into(),
                 prelude: (prelude_allocator, prelude),
@@ -1613,6 +1618,35 @@ impl HostList {
                 (before != wanted).then_some(before)
             }
         }
+    }
+
+    /// Barrier for a loose host buffer first used in `wanted` by this list.
+    /// A buffer created in COMMON promotes on first use, so the first use
+    /// needs no barrier; later changes of use do.
+    pub(crate) fn move_buffer(
+        &self,
+        resource: &ID3D12Resource,
+        wanted: u32,
+    ) -> Option<D3D12_RESOURCE_BARRIER> {
+        let wanted = legal_state(resource, wanted);
+        let mut states = self.buffer_states.lock().unwrap_or_else(|e| e.into_inner());
+        let key = resource.as_raw() as usize;
+        let before = match states.entry(key) {
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert(wanted);
+                return None;
+            }
+            std::collections::hash_map::Entry::Occupied(mut o) => {
+                std::mem::replace(o.get_mut(), wanted)
+            }
+        };
+        (before != wanted).then(|| {
+            transition(
+                resource,
+                D3D12_RESOURCE_STATES(before as i32),
+                D3D12_RESOURCE_STATES(wanted as i32),
+            )
+        })
     }
 
     /// [`HostList::transition`] for a host texture of ours (a twin's

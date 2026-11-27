@@ -1234,6 +1234,10 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
             SamplerFeedbackMipRegion: Default::default(),
         };
         let formats: Vec<DXGI_FORMAT> = castable_formats.iter().map(|&f| DXGI_FORMAT(f as i32)).collect();
+        // D3D12 rejects a non-NULL pCastableFormats with no formats. Most
+        // textures have none, so do not send an empty list and take the
+        // debug layer's error (and the fallback) on every single creation.
+        let castable = (!formats.is_empty()).then_some(formats.as_slice());
         // SAFETY: a host description and our out pointer; the list and the
         // clear value live through the call.
         let made = unsafe {
@@ -1244,7 +1248,7 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
                 D3D12_BARRIER_LAYOUT_COMMON,
                 clear_value,
                 None::<&ID3D12ProtectedResourceSession>,
-                Some(&formats),
+                castable,
                 &mut texture,
             )
         };

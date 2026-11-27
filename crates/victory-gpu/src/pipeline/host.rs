@@ -504,6 +504,30 @@ fn push_marks_params(params: &mut Vec<D3D12_ROOT_PARAMETER1>) -> (u32, u32) {
     (first, first + 1)
 }
 
+/// Console graphics state may ask for conservative rasterization, which GCN4
+/// does not implement. Drop that bit for the host PSO when the device reports
+/// no support, instead of letting the debug layer reject the state.
+fn host_rasterizer(device: &ID3D12Device, g: &GraphicsState) -> D3D12_RASTERIZER_DESC {
+    let mut r = g.rasterizer;
+    if r.ConservativeRaster == D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON {
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+        let supported = unsafe {
+            device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        }
+        .is_ok()
+            && options.ConservativeRasterizationTier
+                != D3D12_CONSERVATIVE_RASTERIZATION_TIER_NOT_SUPPORTED;
+        if !supported {
+            r.ConservativeRaster = D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF;
+        }
+    }
+    r
+}
+
 /// Diagnostic: write a host pipeline's shader and root-signature bytes so a
 /// refused one can be compared byte-for-byte with one the same driver accepts.
 /// `VICTORY_DUMP_PSO_DXIL=1` (off by default).
@@ -772,7 +796,7 @@ impl HostPipeline {
             },
             BlendState: g.blend,
             SampleMask: g.sample_mask,
-            RasterizerState: g.rasterizer,
+            RasterizerState: host_rasterizer(&host.device, g),
             DepthStencilState: g.depth,
             InputLayout: D3D12_INPUT_LAYOUT_DESC {
                 pInputElementDescs: g.inputs.as_ptr(),
@@ -1013,7 +1037,7 @@ fn emulated_mesh_pipeline(
         PS: ps_code,
         BlendState: g.blend,
         SampleMask: g.sample_mask,
-        RasterizerState: g.rasterizer,
+        RasterizerState: host_rasterizer(&host.device, g),
         DepthStencilState: g.depth,
         InputLayout: D3D12_INPUT_LAYOUT_DESC {
             pInputElementDescs: std::ptr::null(),

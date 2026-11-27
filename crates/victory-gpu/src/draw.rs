@@ -501,6 +501,7 @@ impl State {
         // Vertex buffers the input layout reads.
         let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
         let mut count = 0;
+        let mut barriers = Vec::new();
         for (slot, (view, &v)) in views.iter_mut().zip(&self.vertex).enumerate() {
             if p.slots & 1 << slot == 0 {
                 continue;
@@ -513,6 +514,12 @@ impl State {
                 continue;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            if let Some(barrier) = list.move_buffer(
+                &shadow.buffer,
+                D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER.0 as u32,
+            ) {
+                barriers.push(barrier);
+            }
             *view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -521,6 +528,9 @@ impl State {
         }
         // SAFETY: an open list; the views name live host buffers.
         unsafe {
+            if !barriers.is_empty() {
+                l.ResourceBarrier(&barriers);
+            }
             if count > 0 {
                 l.IASetVertexBuffers(0, Some(&views[..count]));
             }
@@ -532,13 +542,22 @@ impl State {
                 return false;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            let barrier = list.move_buffer(
+                &shadow.buffer,
+                D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER.0 as u32,
+            );
             let view = D3D12_INDEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
                 Format: DXGI_FORMAT(v.format as i32),
             };
             // SAFETY: an open list; the view names a live host buffer.
-            unsafe { l.IASetIndexBuffer(Some(&view)) };
+            unsafe {
+                if let Some(barrier) = barrier {
+                    l.ResourceBarrier(&[barrier]);
+                }
+                l.IASetIndexBuffer(Some(&view));
+            }
         }
         const RENDER_TARGET: u32 = 0x4;
         const DEPTH_WRITE: u32 = 0x10;
