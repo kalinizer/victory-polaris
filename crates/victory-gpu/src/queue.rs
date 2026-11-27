@@ -294,6 +294,7 @@ extern "system" fn present(
         let slice = unsafe { std::slice::from_raw_parts(plane_parameters, planes.min(8) as usize) };
         let mut handles: Vec<This> = Vec::with_capacity(slice.len());
         for (i, plane) in slice.iter().enumerate() {
+            let _ = i; // used by the diagnostics log below
             if plane.count == 0 || plane.resources.is_null() {
                 continue;
             }

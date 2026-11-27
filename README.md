@@ -344,7 +344,12 @@ Switches below are off when unset or `0`.
 | `VICTORY_ROOT_SIG_FALLBACK=1` | retry root signature serialization and creation without directly-indexed heap flags (0xC01/0xC00) if the host runtime rejects them; warns once with the flags and error (upstream #626 experiment) |
 | `VICTORY_LOG_PLANES` | with `VICTORY_CAPTURE`, log each present plane's index/count/dimensions/format and the last draw target's dimensions |
 | `VICTORY_SCREEN_PIPELINES` | give no-input/no-depth fullscreen pipelines a separate queue and a 20 s wait budget, so one-shot lighting tables are not starved behind world pipelines (upstream #2435 experiment) |
-| `VICTORY_AMBIENT=<level>` | constant ambient light for unlit surfaces (`off` for none) |
+| `VICTORY_AMBIENT=<share>` | scene-derived indirect light stand-in: a positive number is the share of the estimate (`0.6` default/unset, `0.8` tuned in the AMD fork), `off`/`0` disables; `constant:<level>` is the old flat constant. The estimate follows the title's `CS_CacheScreenSpaceRadiance` output and scene depth, and filters the magenta garbage probes left by uninitialized memory on AMD |
+| `VICTORY_AMBIENT_SHADE=<strength>,<radius>` | creases' shade (default `1.0,0.6`) |
+| `VICTORY_AMBIENT_SETTLE=<ms>[,<jump>[,<fresh s>]]` | slow mean's settling (default `250,3`; `0` disables clock-based settling) |
+| `VICTORY_AMBIENT_AIR=<multiple>` | cap what the air scatters by a multiple of the light around (off by default) |
+| `VICTORY_FALLBACK_HEAPS=1` | bind one-slot shader-visible host view/sampler heaps where a list sets none, for directly-indexed root signatures (a UI draw that sets no heaps otherwise samples null descriptors and shows a flat gradient) |
+| `VICTORY_PRESENT_ALL_RESOURCES=1` | show every resource listed by a PresentX plane, not just the first (planes here have `count=1`, so this changes nothing on this title — kept as a diagnostic) |
 | `VICTORY_CARD_BUFFERS_MB=<n>` | cap on host copies of title buffers |
 | `VICTORY_CARD_BUFFERS_MIN_KB=<n>` | copies smaller than this bypass the cap — set low to make the cap effective |
 | `VICTORY_SNAPSHOT_POOL_MIB=<n>` | snapshot buffers kept for reuse (default 512 MiB, was hardcoded 2 GiB; 0 disables reuse) — lowers resident memory on 16 GB machines |

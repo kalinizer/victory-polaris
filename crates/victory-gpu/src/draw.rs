@@ -1174,6 +1174,7 @@ impl State {
             return false;
         };
         let Some(role) = stage.shader.ambient else {
+            once!(name = %p.name, "no ambient role on a dispatched compute pipeline");
             return false;
         };
         let t = stage.translated();
