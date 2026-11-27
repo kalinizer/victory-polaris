@@ -1014,7 +1014,16 @@ fn emulated_mesh_pipeline(
     ) {
         Ok(pso) => pso,
         Err(e) => {
-            tracing::warn!(error = %e, ?shaders, "emulated mesh graphics pipeline refused");
+            tracing::warn!(
+                error = %e,
+                ?shaders,
+                depth_enable = ?g.depth.DepthEnable,
+                depth_format = ?g.depth_format,
+                num_rts = g.targets.NumRenderTargets,
+                topology = ?g.topology,
+                inputs = g.inputs.len(),
+                "emulated mesh graphics pipeline refused"
+            );
             host.log_messages();
             return None;
         }
