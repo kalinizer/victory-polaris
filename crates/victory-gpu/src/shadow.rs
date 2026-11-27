@@ -179,6 +179,26 @@ static SHADOW_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 static FIND_OUTSIDE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FIND_BUFFER_BUDGET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FIND_LOOSE_BUDGET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Registered buffers whose copy was refused by the card-buffers budget and
+/// whose root view was routed into a bounded loose window instead of a sink
+/// (the `VICTORY_ROOT_VIEW_REGISTERED_LOOSE` fix).
+static FIND_BUFFER_LOOSE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether a registered buffer refused by the card-buffers budget gets a
+/// bounded loose window for its root views instead of a per-address sink
+/// (`VICTORY_ROOT_VIEW_REGISTERED_LOOSE`, on by default; `0` restores the
+/// baseline sink/null fallback). Also gates the sink arena and fill dedup.
+pub(crate) fn registered_loose() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let on = !matches!(
+            std::env::var("VICTORY_ROOT_VIEW_REGISTERED_LOOSE").as_deref(),
+            Ok("0")
+        );
+        tracing::info!(enabled = on, "registered-buffer root-view loose fallback");
+        on
+    })
+}
 
 /// Ticks of [`let_go_idle`] and the last tick each loose window was used.
 /// The tick doubles as the window's LRU key when the count ceiling is hit.
@@ -1065,6 +1085,16 @@ pub(crate) fn find_reaching(address: u64, reach: u64) -> Option<Arc<Shadow>> {
             return Some(shadow);
         }
         FIND_BUFFER_BUDGET.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if registered_loose() {
+            // The registered copy is genuinely refused. A sink would be one
+            // 1 MiB allocation per distinct root address; the loose cache is
+            // shared per 1 MiB cell and bounded by `VICTORY_ROOT_VIEW_WINDOWS`
+            // and `VICTORY_CARD_BUFFERS_MB`. `loose` reclaims unused windows
+            // before allocating, so this cannot grow the working set without
+            // bound. If even that fails the caller keeps its null fallback.
+            FIND_BUFFER_LOOSE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return loose(address, address.checked_add(reach)?);
+        }
         return None;
     }
     FIND_OUTSIDE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1298,13 +1328,19 @@ pub(crate) fn log_views(frames: f64) {
             bytes as f64 / frames / 1e3
         );
     }
-    let [outside, over_buffer, over_window] =
-        [&FIND_OUTSIDE, &FIND_BUFFER_BUDGET, &FIND_LOOSE_BUDGET].map(|c| c.swap(0, Relaxed));
-    if outside + over_buffer + over_window > 0 {
+    let [outside, over_buffer, over_window, loose_fallback] = [
+        &FIND_OUTSIDE,
+        &FIND_BUFFER_BUDGET,
+        &FIND_LOOSE_BUDGET,
+        &FIND_BUFFER_LOOSE,
+    ]
+    .map(|c| c.swap(0, Relaxed));
+    if outside + over_buffer + over_window + loose_fallback > 0 {
         tracing::info!(
-            "root-view copies/frame: {:.0} outside title buffers, {:.0} buffer copies refused by the budget, {:.0} windows refused by the budget",
+            "root-view copies/frame: {:.0} outside title buffers, {:.0} buffer copies refused by the budget ({:.0} routed to loose windows), {:.0} windows refused by the budget",
             outside as f64 / frames,
             over_buffer as f64 / frames,
+            loose_fallback as f64 / frames,
             over_window as f64 / frames
         );
     }

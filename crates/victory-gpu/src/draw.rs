@@ -253,15 +253,53 @@ fn mesh_draw_slot() -> bool {
 /// memory has no host copy (`VICTORY_ROOT_VIEW_SINK_MB`). Before this, each
 /// refusal allocated its own 1 MiB `shared_buffer`, held by the list until
 /// reset: ~5000 refusals a frame during scene load exhausted commit with
-/// `0x8007000E` (even a 256-byte allocation failed). The first hard error was
-/// `prelude()`'s allocator/list creation hitting the same wall. Sinks are
-/// keyed by (address, size) and reused by later lists in the same frame; once
-/// the cap is spent we bind the null raw view the fallback already has.
+/// `0x8007000E` (even a 256-byte allocation failed). With the registered-view
+/// loose fallback on (`VICTORY_ROOT_VIEW_REGISTERED_LOOSE`, the default) the
+/// pool is ONE arena resource of `VICTORY_ROOT_VIEW_SINK_MB` bytes carved into
+/// 1 MiB slots: a sink records its slot offset, not a separate buffer. The
+/// baseline (`=0`) still makes one buffer per sink. Sinks are keyed by
+/// (address, size) and reused by later lists in the same frame; once the cap
+/// is spent we bind the null raw view the fallback already has.
 struct Sink {
     address: u64,
     bytes: u64,
+    /// Byte offset of this sink in its buffer: a slot in the arena, or 0 for
+    /// the baseline's standalone buffer.
+    offset: u64,
+    /// A standalone buffer for the baseline; `None` means borrow the arena.
+    standalone: Option<(ID3D12Resource, *mut u8)>,
+}
+
+/// What a borrowed sink gives its list: the resource to keep and name the
+/// view with, its mapped base and the byte offset of this sink inside it.
+struct SinkView {
     buffer: ID3D12Resource,
     data: *mut u8,
+    offset: u64,
+}
+
+impl SinkView {
+    /// Where the submission-time fill writes its 1 MiB of title data.
+    fn dst(&self) -> *mut u8 {
+        // SAFETY: the caller's `bytes` fits between `offset` and the end of
+        // the mapped arena/standalone buffer.
+        unsafe { self.data.add(self.offset as usize) }
+    }
+}
+
+impl Sink {
+    /// A usable view of this entry, from its own buffer or from `arena`.
+    fn view(&self, arena: Option<&(ID3D12Resource, *mut u8)>) -> Option<SinkView> {
+        let (buffer, data) = match &self.standalone {
+            Some(b) => b,
+            None => arena?,
+        };
+        Some(SinkView {
+            buffer: buffer.clone(),
+            data: *data,
+            offset: self.offset,
+        })
+    }
 }
 
 // SAFETY: D3D12 resources and their mapped pointers are free-threaded; the
@@ -271,15 +309,24 @@ unsafe impl Sync for Sink {}
 
 #[derive(Default)]
 struct SinkPool {
+    /// The one arena and its mapped base, made on first use and kept across
+    /// frames (the pool's entries are per frame, the resource is not).
+    arena: Option<(ID3D12Resource, *mut u8)>,
     sinks: Vec<Sink>,
-    bytes: u64,
     frame: u64,
 }
 
+// SAFETY: the arena's mapped pointer is written only by submitting threads
+// while the mutex is held, and entries keep their own COM references.
+unsafe impl Send for SinkPool {}
+
 /// At most this many sinks per frame. With 1 MiB SRV/UAV sinks this is also
-/// the 64 MiB default byte cap; the byte cap still applies to larger values.
+/// the 64 MiB default arena byte cap; the byte cap still applies to larger
+/// values.
 const MAX_SINKS: usize = 64;
 const DEFAULT_SINK_MB: u64 = 64;
+/// Bytes per arena slot: the reach a root SRV/UAV needs (`sink_bytes`).
+const SINK_SLOT: u64 = 1 << 20;
 
 /// Parses the sink cap; `0` disables sinks (always a null view). Kept separate
 /// from [`sink_cap_bytes`] so parsing can be tested without touching the env.
@@ -313,8 +360,8 @@ fn sink_bytes(_uav: bool) -> u64 {
 }
 
 static SINKS: std::sync::Mutex<SinkPool> = std::sync::Mutex::new(SinkPool {
+    arena: None,
     sinks: Vec::new(),
-    bytes: 0,
     frame: u64::MAX,
 });
 static SINKS_CREATED: AtomicU64 = AtomicU64::new(0);
@@ -324,12 +371,12 @@ static SINKS_NULLED: AtomicU64 = AtomicU64::new(0);
 /// The pool for `frame`, dropping entries from earlier frames. Every host
 /// submission is waited for before the next one (`HostList::reset`), so a
 /// sink recorded in an earlier frame is no longer read by the GPU; the list
-/// and view heap still hold their own references until they are reset.
+/// and view heap still hold their own references until they are reset. The
+/// arena itself is kept: it is one allocation for the whole process.
 fn sink_pool(frame: u64) -> std::sync::MutexGuard<'static, SinkPool> {
     let mut pool = SINKS.lock().unwrap_or_else(|e| e.into_inner());
     if pool.frame != frame {
         pool.sinks.clear();
-        pool.bytes = 0;
         pool.frame = frame;
         SINKS_CREATED.store(0, Ordering::Relaxed);
         SINKS_REUSED.store(0, Ordering::Relaxed);
@@ -353,10 +400,12 @@ fn null_sink(frame: u64, address: u64, bytes: u64) {
     }
 }
 
-/// Borrows a sink for `address`, allocating one only while the pool has room.
-/// Returns a clone of the resource so the caller can keep it on its list and
-/// make the view; the pool owns the original until the frame rolls over.
-fn sink(frame: u64, address: u64, bytes: u64) -> Option<(ID3D12Resource, *mut u8)> {
+/// Borrows a sink for `address`, taking the next free slot of the arena (or
+/// a standalone buffer in the baseline). Returns the resource and the byte
+/// offset to keep on the list and make the view from; the pool owns the arena
+/// and the entry until the frame rolls over. A spent pool falls back to the
+/// null view, never to a stale entry or a null pointer to fill.
+fn sink(frame: u64, address: u64, bytes: u64) -> Option<SinkView> {
     let cap = sink_cap_bytes();
     if cap == 0 {
         null_sink(frame, address, bytes);
@@ -369,27 +418,65 @@ fn sink(frame: u64, address: u64, bytes: u64) -> Option<(ID3D12Resource, *mut u8
         .find(|s| s.address == address && s.bytes == bytes)
     {
         SINKS_REUSED.fetch_add(1, Ordering::Relaxed);
-        return Some((entry.buffer.clone(), entry.data));
+        return entry.view(pool.arena.as_ref());
     }
-    if pool.sinks.len() >= MAX_SINKS || pool.bytes.saturating_add(bytes) > cap {
+    if pool.sinks.len() >= MAX_SINKS {
         drop(pool);
         null_sink(frame, address, bytes);
         return None;
     }
+    if crate::shadow::registered_loose() {
+        // One arena, `VICTORY_ROOT_VIEW_SINK_MB` bytes, carved into 1 MiB
+        // slots. The slot offset is the view's byte `first`; `raw_view_at`
+        // turns it into `FirstElement = offset / 4` dwords.
+        let offset = pool.sinks.len() as u64 * SINK_SLOT;
+        if offset.saturating_add(bytes) > cap {
+            drop(pool);
+            null_sink(frame, address, bytes);
+            return None;
+        }
+        if pool.arena.is_none() {
+            let Some((buffer, data)) = crate::host::host().and_then(|h| h.shared_buffer(cap)) else {
+                drop(pool);
+                null_sink(frame, address, bytes);
+                return None;
+            };
+            crate::host::name(&buffer, || format!("root-view sink arena {cap} bytes"));
+            pool.arena = Some((buffer, data));
+        }
+        let view = pool.arena.as_ref().map(|(buffer, data)| SinkView {
+            buffer: buffer.clone(),
+            data: *data,
+            offset,
+        });
+        pool.sinks.push(Sink {
+            address,
+            bytes,
+            offset,
+            standalone: None,
+        });
+        SINKS_CREATED.fetch_add(1, Ordering::Relaxed);
+        return view;
+    }
+    // Baseline: one 1 MiB `shared_buffer` per sink, held by the entry.
     let Some((buffer, data)) = crate::host::host().and_then(|h| h.shared_buffer(bytes)) else {
         drop(pool);
         null_sink(frame, address, bytes);
         return None;
     };
+    let view = SinkView {
+        buffer: buffer.clone(),
+        data,
+        offset: 0,
+    };
     pool.sinks.push(Sink {
         address,
         bytes,
-        buffer: buffer.clone(),
-        data,
+        offset: 0,
+        standalone: Some((buffer, data)),
     });
-    pool.bytes += bytes;
     SINKS_CREATED.fetch_add(1, Ordering::Relaxed);
-    Some((buffer, data))
+    Some(view)
 }
 
 /// Sinks created, reused and nulled in `frame`, for the frame diagnostics
@@ -1311,10 +1398,13 @@ impl State {
                 // debug layer. Neither drops the dispatch.
                 let bytes = sink_bytes(uav);
                 match sink(crate::frame::current(), address, bytes) {
-                    Some((buffer, data)) => {
-                        list.keep(&buffer);
-                        list.defer_fill(data, address as *const u8, bytes as usize);
-                        host.raw_view_at(index, Some(&buffer), 0, bytes, uav);
+                    Some(s) => {
+                        list.keep(&s.buffer);
+                        list.defer_fill(s.dst(), address as *const u8, bytes as usize);
+                        // `raw_view_at` divides this byte offset by four for
+                        // the view's `FirstElement` (dwords, as the title's
+                        // root-view offsets are counted). Slot 0 starts at 0.
+                        host.raw_view_at(index, Some(&s.buffer), s.offset, bytes, uav);
                         once!(slot, address, "a root view has no copy: using a pooled sink view");
                     }
                     None => {

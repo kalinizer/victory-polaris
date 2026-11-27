@@ -360,8 +360,9 @@ Switches below are off when unset or `0`, unless the row says otherwise.
 | `VICTORY_IDLE_RECLAIM=0` | turn off the periodic release of idle title-memory shadow windows (on by default; reclaim starts past **half** of `VICTORY_CARD_BUFFERS_MB`, or at the window ceiling, and then drops every unused window) |
 | `VICTORY_IDLE_FRAMES=<n>` | ticks without a use before a window goes when there is no pressure (default 2; was 4) |
 | `VICTORY_ROOT_VIEW_WINDOWS=<n>` | hard ceiling on live loose root-view windows, with oldest-used eviction (default 256) |
+| `VICTORY_ROOT_VIEW_REGISTERED_LOOSE=1\|0` | route root views of registered buffers refused by `VICTORY_CARD_BUFFERS_MB` into bounded loose windows instead of per-address sinks (on by default; `0` restores the baseline sink/null fallback, the single-buffer sink pool and un-deduped fills) |
 | `VICTORY_ROOT_VIEW_MB=<n>` | cap on the bytes refreshed per root view (default **1** MiB). `0` explicitly means unlimited (refresh to the copy's end): risky here — it made ~1000 root views/frame copy ~1.3 GB/frame and fail with `0x8007000E`. A positive value larger than 1 may be needed if a shader's data sits past the first MiB |
-| `VICTORY_ROOT_VIEW_SINK_MB=<n>` | hard cap on the pooled 1 MiB filled buffers used for root SRV/UAV views with no host copy (default **64** MiB, at most 64 sinks/frame; CBVs use 64 KiB upload scratch and never enter the pool). `0` disables sinks and always binds a null raw view. Without this cap ~5000 refusals/frame each kept a fresh 1 MiB buffer until list reset, exhausting commit at scene load (`0x8007000E`) |
+| `VICTORY_ROOT_VIEW_SINK_MB=<n>` | size of the single sink arena (1 MiB slots) for root SRV/UAV views with no host copy (default **64** MiB = 64 slots; CBVs use 64 KiB upload scratch and never enter the pool). `0` disables sinks and always binds a null raw view. With `VICTORY_ROOT_VIEW_REGISTERED_LOOSE=0` each sink is a separate buffer instead. Without a cap ~5000 refusals/frame each kept a fresh 1 MiB buffer until list reset, exhausting commit at scene load (`0x8007000E`) |
 | `VICTORY_RENDER_SCALE=<factor>` | shrink the **swap chain** only (`0.5`, `0.75`; `1`/unset keeps the title's size). The title still renders into its own targets, so this saves swap-chain memory and sampling work, **not** the 7+ GB of host textures. A scaled single plane goes through the sampling compositor instead of `CopyResource` |
 | `VICTORY_TEXTURE_MAX=<pixels>` | cap a sampled host texture's largest side by leaving out its top mips (power-of-two 2D sampled textures only; never below 256 px). `auto` = 1024, dropping to 512 above 92% and 256 above 97% of the card's DXGI budget. Unset: title sizes unchanged. The largest memory win |
 | `VICTORY_TEXTURE_MB=<n>` | per-texture host allocation budget in MiB, clamped to VRAM/4 (the small-VRAM preset rule). Top mips are left out until the estimated allocation fits; combines with `VICTORY_TEXTURE_MAX`. Unset: no byte budget |
@@ -387,7 +388,8 @@ $env:VICTORY_IDLE_FRAMES         = '2'      # default; 1 is more aggressive
 $env:VICTORY_MESH_DRAW_BUDGET    = '512'    # 256 if working set still climbs; 0 = unlimited (do not use here)
 $env:VICTORY_MESH_POOL_MB        = '64'     # hard ceiling on the global mesh pool (default 128)
 $env:VICTORY_MESH_BUFFER_MB      = '16'     # output scratch inside that ceiling
-$env:VICTORY_ROOT_VIEW_SINK_MB   = '64'     # 0 = never allocate a no-copy root-view sink
+$env:VICTORY_ROOT_VIEW_SINK_MB   = '64'     # arena of 1 MiB slots for no-copy root views; 0 = always null
+$env:VICTORY_ROOT_VIEW_REGISTERED_LOOSE = '1' # default; 0 restores the per-address sink/null baseline
 ```
 
 The mesh budget is what keeps the recovered ~4000 indirect draws/frame from

@@ -825,6 +825,10 @@ struct Deferred {
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    /// Fills already queued for this submission (destination, source, bytes),
+    /// so a root view bound in several lists only fills its sink once. A
+    /// title copy makes earlier fills stale, so it clears this too.
+    filled: std::collections::HashSet<(usize, usize, usize)>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
     #[cfg(windows)]
@@ -1972,14 +1976,24 @@ impl HostList {
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
         deferred.refreshed.clear();
+        deferred.filled.clear();
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
-    /// memory at `dst` when the list is submitted.
+    /// memory at `dst` when the list is submitted. With the registered-view
+    /// loose fallback on, a duplicate of the same (destination, source,
+    /// length) is issued once: many draws bind the same root view in one
+    /// submission and would otherwise fill the same sink repeatedly.
     pub(crate) fn defer_fill(&self, dst: *mut u8, src: *const u8, len: usize) {
-        self.deferred()
-            .copies
-            .push(Step::Fill(dst as usize, src as usize, len));
+        let key = (dst as usize, src as usize, len);
+        if crate::shadow::registered_loose() {
+            let mut deferred = self.deferred();
+            if deferred.filled.insert(key) {
+                deferred.copies.push(Step::Fill(key.0, key.1, key.2));
+            }
+        } else {
+            self.deferred().copies.push(Step::Fill(key.0, key.1, key.2));
+        }
     }
 
     /// Brings `[address, address + len)` of a buffer's host copy up to date
