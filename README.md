@@ -330,7 +330,7 @@ Switches below are off when unset or `0`.
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | cap translated loop iterations per lane (own cache entries) |
 | `VICTORY_MESH_EMULATION=1\|0` | force or disable compute+vertex mesh emulation |
 | `VICTORY_MESH_BUFFER_MB=<n>` | intermediate buffer in MiB (`1..=1024`) |
-| `VICTORY_PRESENT_LAST_TARGET` | substitute the frame's last draw target for PresentX plane 0 as the compositor's opaque base (opt-in black-world experiment) |
+| `VICTORY_PRESENT_LAST_TARGET` | substitute the frame's last draw target for PresentX plane 0 as the compositor's opaque base (opt-in experiment — **does not work on this tree**: the target is a 3840×2160 UI plane and the compositor produces an invalid command / `0x80004005`; keep off) |
 | `VICTORY_PRESENT_SUBRES` | single-plane present copies subresource 0 with `CopyTextureRegion` instead of `CopyResource` (upstream #3257 experiment) |
 | `VICTORY_ROOT_SIG_FALLBACK=1` | retry root signature serialization and creation without directly-indexed heap flags (0xC01/0xC00) if the host runtime rejects them; warns once with the flags and error (upstream #626 experiment) |
 | `VICTORY_LOG_PLANES` | with `VICTORY_CAPTURE`, log each present plane's index/count/dimensions/format and the last draw target's dimensions |
