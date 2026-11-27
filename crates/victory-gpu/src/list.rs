@@ -710,9 +710,18 @@ extern "system" fn clear_rtv(
             return;
         };
         // SAFETY: the title passes four floats (null is tolerated).
-        let Some(color) = (unsafe { color.as_ref() }) else {
+        let Some(title_color) = (unsafe { color.as_ref() }) else {
             return;
         };
+        // Opt-in diagnostic: force a visible clear colour so a world target
+        // that no pass writes shows up as that colour instead of black.
+        // `VICTORY_CLEAR_COLOR=r,g,b,a`; leave unset for the title's value.
+        let override_color = std::env::var("VICTORY_CLEAR_COLOR").ok().and_then(|v| {
+            let p: Vec<f32> = v.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+            (p.len() == 4).then(|| [p[0], p[1], p[2], p[3]])
+        });
+        let forced = override_color.unwrap_or(*title_color);
+        let color = &forced;
         let rects = (count > 0 && !rects.is_null()).then(|| {
             // SAFETY: the title passes `count` rectangles, laid out as the host's.
             unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
