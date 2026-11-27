@@ -255,10 +255,11 @@ fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
 
 impl State {
     pub(crate) fn reset(&mut self, pipeline: This) {
-        // Before recording a new list: its submissions have run, so any
-        // window no list or slot still holds can be released.
-        crate::shadow::let_go_idle();
+        // Drop the old list's slots first: a window only they held becomes
+        // idle in this reset instead of one tick later. Then, before
+        // recording a new list, release what is idle under pressure.
         *self = State::default();
+        crate::shadow::let_go_idle();
         self.pipeline = pipeline as usize;
     }
 
@@ -2672,17 +2673,20 @@ fn root_view_fallback() -> bool {
 }
 
 /// Bytes of title memory a root view brings up to date (`VICTORY_ROOT_VIEW_MB`).
-/// Unset or `0` reaches the end of the copy: the old 1 MiB cut left meshes
-/// without bodies (vertex streams past the first MiB). A positive value caps
-/// the refresh, for runs where copying whole windows costs too much.
+/// Unset is 1 MiB, the old cut: the port's unlimited default made each of
+/// ~1000 root views a frame refresh to the end of its 1-2 MiB copy (~1.3 GB
+/// of CPU copies and ~57k page faults per frame in the crashed run), and the
+/// churn exhausted D3D12 memory with 0x8007000E. A positive value caps the
+/// refresh. `0` explicitly asks for unlimited (to the copy's end): risky on
+/// this workload — meshes whose vertex streams sit past the first MiB lose
+/// their bodies — but available for runs that need the reach.
 fn root_view_limit() -> u64 {
     static BYTES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *BYTES.get_or_init(|| {
         std::env::var("VICTORY_ROOT_VIEW_MB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .filter(|&n| n > 0)
-            .map_or(u64::MAX, |n| n.saturating_mul(1 << 20))
+            .map_or(1 << 20, |n| if n == 0 { u64::MAX } else { n.saturating_mul(1 << 20) })
     })
 }
 
@@ -2835,11 +2839,10 @@ void main(uint3 id : SV_DispatchThreadID) {
 
     /// Root views (`victory_shader::emit`, "Root SRVs and root UAVs") through
     /// our device: a raw view of the host copy holding the root address,
-    /// brought up to date from there to the copy's end, so data 1.5 MiB past
-    /// the root address (past the 1 MiB the old root views brought up to
-    /// date) reads right; reads past the copy's end read 0 (a host root
-    /// descriptor read whatever lay there). Two root addresses in one copy
-    /// share its view.
+    /// brought up to date from there for `VICTORY_ROOT_VIEW_MB` bytes
+    /// (1 MiB by default), so data inside the cap reads right. Data past the
+    /// cap, or past the copy's end, reads 0 (a host root descriptor read
+    /// whatever lay there). Two root addresses in one copy share its view.
     #[test]
     fn root_views_reach_their_copy_and_read_zeros_past_it() {
         let Some(host) = crate::host::host() else {
@@ -2870,23 +2873,29 @@ void main(uint3 id : SV_DispatchThreadID) {
         let list = host.new_list().unwrap();
         let out = crate::shadow::find(dst_bytes as u64, 256).expect("the output's host copy");
         let src = src_bytes as u64;
-        let cases = [
-            // Data 1.5 MiB past the root address.
+        // (root address, offset of the data, bytes written there, what the
+        // shader reads through the root view).
+        let cases: [(u64, u32, u32, Vec<u32>); 3] = [
+            // Data inside the default 1 MiB refresh cap.
             (
                 src + 0x100,
-                0x18_0000u32,
-                (0..16).map(|k| 0x5000 + k).collect::<Vec<u32>>(),
+                0x8_0000,
+                0x5000,
+                (0..16).map(|k| 0x5000 + k).collect(),
             ),
+            // The default cap stops at 1 MiB: 1.5 MiB past is not copied.
+            (src + 0x100, 0x18_0000, 0x6000, vec![0; 16]),
             // The copy's last 256 bytes: four lanes inside, the rest past it.
             (
                 src + 4 * MIB - 256,
                 0,
+                0x7000,
                 (0..16)
                     .map(|k| if k < 4 { 0x7000 + k } else { 0 })
                     .collect(),
             ),
         ];
-        for (round, (address, offset, want)) in cases.into_iter().enumerate() {
+        for (round, (address, offset, value, want)) in cases.into_iter().enumerate() {
             if round > 0 {
                 list.reset();
             }
@@ -2921,13 +2930,8 @@ void main(uint3 id : SV_DispatchThreadID) {
             for k in 0..16u64 {
                 let at = address + u64::from(offset) + 64 * k;
                 if at + 4 <= src + 4 * MIB {
-                    let value = if round == 0 {
-                        0x5000 + k as u32
-                    } else {
-                        0x7000 + k as u32
-                    };
                     // SAFETY: inside the title buffer.
-                    unsafe { (at as *mut u32).write(value) };
+                    unsafe { (at as *mut u32).write(value + k as u32) };
                 }
             }
             host.execute(&[&list]);

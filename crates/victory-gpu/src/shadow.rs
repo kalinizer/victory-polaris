@@ -180,14 +180,50 @@ static FIND_OUTSIDE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 static FIND_BUFFER_BUDGET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FIND_LOOSE_BUDGET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Ticks of [`let_go_idle`] and the last tick a loose window was asked for.
-/// Idle windows are released before a new list is recorded, rather than only
-/// when an allocation is refused: thousands of root views a frame would
-/// otherwise pin the cache at its cap.
+/// Ticks of [`let_go_idle`] and the last tick each loose window was used.
+/// The tick doubles as the window's LRU key when the count ceiling is hit.
 static IDLE_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static LOOSE_USED: Mutex<BTreeMap<(u64, u64), u64>> = Mutex::new(BTreeMap::new());
-/// Ticks without a use before a window is idle (`IDLE_FRAMES`).
-const IDLE_FRAMES: u64 = 4;
+/// Ticks without a use before a window is idle when nothing is pressing
+/// (`VICTORY_IDLE_FRAMES`, default 2). Under pressure all unused windows go
+/// at once, whatever their age.
+fn idle_frames() -> u64 {
+    static FRAMES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *FRAMES.get_or_init(|| {
+        std::env::var("VICTORY_IDLE_FRAMES")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(2)
+    })
+}
+
+/// Hard ceiling on live loose windows (`VICTORY_ROOT_VIEW_WINDOWS`). The
+/// budget alone was not enough: thousands of distinct root-view addresses a
+/// frame left more windows pinned by lists than could be reclaimed, until
+/// `shared_buffer` started failing with 0x8007000E.
+fn window_limit() -> usize {
+    static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let n = std::env::var("VICTORY_ROOT_VIEW_WINDOWS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(256);
+        tracing::info!(loose_window_limit = n, "root-view window ceiling");
+        n
+    })
+}
+
+/// Fraction of `VICTORY_CARD_BUFFERS_MB` at which [`let_go_idle`] begins to
+/// release unused loose windows. Half, not three quarters: allocation
+/// failures start well before the nominal cap on an 8 GB card.
+fn reclaim_at() -> u64 {
+    card_limits().1 / 2
+}
+
+/// Number of loose windows currently in the map (diagnostics and ceiling).
+fn loose_len() -> usize {
+    LOOSE.lock().unwrap_or_else(|e| e.into_inner()).len()
+}
 
 /// Whether one more copy of `size` bytes may be made.
 fn shadow_room(size: u64) -> bool {
@@ -959,6 +995,13 @@ fn in_buffer(map: &BTreeMap<(u64, usize), Entry>, address: u64) -> bool {
 /// The copy of the innermost title buffer holding `[address, address +
 /// len)`, made on first use.
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    find_inner(address, len, true)
+}
+
+/// [`find`], with `count` off for the speculative attempts a root view makes
+/// after freeing idle windows: a refusal on the first attempt is not a
+/// refusal of the draw.
+fn find_inner(address: u64, len: u64, count: bool) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
     let mut map = buffers();
     let key = map
@@ -977,7 +1020,9 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
         // Shaders write some buffers (unordered access), so not upload memory.
         if !shadow_room(len.next_multiple_of(1 << 16)) {
-            FIND_BUFFER_BUDGET.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if count {
+                FIND_BUFFER_BUDGET.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             return None;
         }
         let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(1 << 16))?;
@@ -1009,7 +1054,18 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
 /// through the view is a GPU page fault.
 pub(crate) fn find_reaching(address: u64, reach: u64) -> Option<Arc<Shadow>> {
     if in_buffer(&buffers(), address) {
-        return find(address, 1);
+        // The buffer is registered but its copy may have been refused by the
+        // budget. Before giving the draw a 1 MiB fallback sink (another
+        // allocation, and one per distinct root address), release unused
+        // loose windows and try the real copy again.
+        if let Some(shadow) = find_inner(address, 1, false) {
+            return Some(shadow);
+        }
+        if evict_unused(0, None) > 0 && let Some(shadow) = find_inner(address, 1, false) {
+            return Some(shadow);
+        }
+        FIND_BUFFER_BUDGET.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return None;
     }
     FIND_OUTSIDE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     loose(address, address.checked_add(reach)?)
@@ -1018,59 +1074,74 @@ pub(crate) fn find_reaching(address: u64, reach: u64) -> Option<Arc<Shadow>> {
 /// Titles also use memory outside any buffer object as GPU memory (Grand
 /// Theft Auto VI's interface vertices, from its own allocator). Such memory
 /// gets copies of the aligned windows it touches.
-const WINDOW: u64 = 4 << 20;
+///
+/// A 4 MiB alignment made a view whose `address + reach` crossed the cell's
+/// end take 8 MiB; at ~570 distinct outside root addresses a frame those
+/// windows accumulated faster than they could be reclaimed. Windows are
+/// still shared per aligned cell (never made per exact address), but the
+/// cell is now 1 MiB and each window covers at least one cell: 1-2 MiB,
+/// with room for a constant view's stream data past its 64 KiB reach.
+const WINDOW: u64 = 1 << 20;
 
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
 
-fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
+/// The aligned window covering `[address, end)`: one cell at minimum, plus
+/// whatever it takes to reach `end` when the view starts near a cell's end.
+fn window_for(address: u64, end: u64) -> Option<(u64, u64)> {
     let start = address & !(WINDOW - 1);
-    let len = end.next_multiple_of(WINDOW) - start;
-    let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
-    let found = map.get(&(start, len)).cloned();
-    if let Some(shadow) = found {
-        // Release the window map before the use map: `let_go_idle` takes
-        // them in the same order, but never while holding the other.
-        drop(map);
-        LOOSE_USED
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert((start, len), IDLE_TICK.load(std::sync::atomic::Ordering::Relaxed));
-        return Some(shadow);
-    }
-    if !shadow_room(len) {
-        // The map is the only permanent owner: a view that still uses a copy
-        // holds another Arc. Drop the copies nothing else references so the
-        // bytes (and the budget) come back, rather than refusing this window
-        // and leaving its slots to read zeros. Shadow::drop accounts for the
-        // bytes, so shadow_room sees the freed room immediately.
-        let mut freed = 0u64;
-        map.retain(|key, shadow| {
-            // A window a list still holds, or one with writes to copy back,
-            // is not idle: evicting it would drop those writes.
-            let idle = Arc::strong_count(shadow) == 1
-                && shadow.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
-            if idle {
-                freed += shadow.len;
-                tracing::debug!(start = format_args!("{:#x}", key.0), len = key.1, "evicting unused loose shadow copy");
-                false
-            } else {
-                true
-            }
-        });
-        if freed > 0 {
+    // Covering `end` (the root address plus its declared reach) leaves room
+    // for whatever the shader reaches from it. The minimum of one cell
+    // keeps a 64 KiB constant view from getting a window that faults as
+    // soon as its vertex stream sits past the constants.
+    let len = (end.checked_next_multiple_of(WINDOW)? - start).max(WINDOW);
+    Some((start, len))
+}
+
+fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
+    let (start, len) = window_for(address, end)?;
+    let key = (start, len);
+    {
+        let map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(shadow) = map.get(&key).cloned() {
+            // Release the window map before the use map: `evict_unused`
+            // takes them in the same order, but never while holding the
+            // other.
+            drop(map);
             LOOSE_USED
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .retain(|key, _| map.contains_key(key));
-            tracing::info!(freed_mb = freed >> 20, "reclaimed unused title-memory copies");
+                .insert(key, IDLE_TICK.load(std::sync::atomic::Ordering::Relaxed));
+            return Some(shadow);
         }
-        if !shadow_room(len) {
+    }
+    // Both ceilings are enforced before a new allocation. The oldest
+    // unused windows go first; give up if every remaining one is in use.
+    let at_limit = || loose_len() >= window_limit();
+    if !shadow_room(len) || at_limit() {
+        evict_unused(0, Some(window_limit().saturating_sub(1)));
+        if !shadow_room(len) || at_limit() {
             FIND_LOOSE_BUDGET.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return None;
         }
     }
-    let (buffer, data) = host()?.shared_buffer(len)?;
+    let (buffer, data) = match host()?.shared_buffer(len) {
+        Some(allocated) => allocated,
+        None => {
+            // D3D12 can refuse with 0x8007000E while `SHADOW_BYTES` is still
+            // below the cap (VRAM / system-memory pressure, not our
+            // counter). Release every unused window and retry before the
+            // draw falls back to a filled or null sink view.
+            evict_unused(0, None);
+            match host()?.shared_buffer(len) {
+                Some(allocated) => allocated,
+                None => {
+                    FIND_LOOSE_BUDGET.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return None;
+                }
+            }
+        }
+    };
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -1080,47 +1151,105 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
         "loose memory copied to the host"
     );
     let shadow = Shadow::new(buffer, data, gpu, start, len);
-    map.insert((start, len), shadow.clone());
+    {
+        let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = map.get(&key).cloned() {
+            // Another thread made the same window while we allocated;
+            // keep theirs and let ours go (Shadow::drop accounts for it).
+            drop(map);
+            drop(shadow);
+            LOOSE_USED
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(key, IDLE_TICK.load(std::sync::atomic::Ordering::Relaxed));
+            return Some(existing);
+        }
+        map.insert(key, shadow.clone());
+    }
     LOOSE_USED
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert((start, len), IDLE_TICK.load(std::sync::atomic::Ordering::Relaxed));
+        .insert(key, IDLE_TICK.load(std::sync::atomic::Ordering::Relaxed));
     changed();
     Some(shadow)
 }
 
-/// Releases loose windows no list, view or pending write is using, once
-/// [`IDLE_FRAMES`] ticks have passed without a use. Called before a new list
-/// is recorded (`crate::draw::State::reset`): waiting for an allocation to
-/// be refused keeps the cache pinned at the budget cap under the thousands
-/// of root views a frame. Only runs past three quarters of the cap, and
+/// Releases loose windows that no list, slot or pending write is using.
+/// `age == 0` takes all of them (pressure: budget refusal, allocation
+/// failure, count ceiling); otherwise only those unused for `age` ticks.
+/// With `limit`, the oldest-used idle windows go first until at most
+/// `limit` remain. Returns the bytes freed; `Shadow::drop` updates
+/// [`SHADOW_BYTES`] before the caller asks [`shadow_room`] again.
+fn evict_unused(age: u64, limit: Option<usize>) -> u64 {
+    let tick = IDLE_TICK.load(std::sync::atomic::Ordering::Relaxed);
+    let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut used = LOOSE_USED.lock().unwrap_or_else(|e| e.into_inner());
+    let mut victims: Vec<((u64, u64), u64)> = map
+        .iter()
+        .filter_map(|(key, shadow)| {
+            // A window a list still holds, or one with writes to copy back,
+            // is not idle: evicting it would drop those writes.
+            if Arc::strong_count(shadow) > 1
+                || !shadow.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+            {
+                return None;
+            }
+            let last = used.get(key).copied().unwrap_or(tick);
+            (tick.saturating_sub(last) >= age).then_some((*key, last))
+        })
+        .collect();
+    if let Some(limit) = limit {
+        let spare = map.len().saturating_sub(limit);
+        // At or below the ceiling (budget or allocation failure), every
+        // idle window is a victim. Above it, only the oldest ones needed
+        // to get under the ceiling go.
+        if spare > 0 {
+            victims.sort_unstable_by_key(|&(_, last)| last);
+            victims.truncate(spare);
+        }
+    }
+    let mut freed = 0u64;
+    for (key, _) in victims {
+        if let Some(shadow) = map.remove(&key) {
+            freed += shadow.len;
+            tracing::debug!(start = format_args!("{:#x}", key.0), len = key.1, "evicting unused loose shadow copy");
+        }
+        used.remove(&key);
+    }
+    if freed > 0 {
+        used.retain(|key, _| map.contains_key(key));
+    }
+    freed
+}
+
+/// Releases loose windows no list, view or pending write is using. Called
+/// after the old list's state is dropped (`crate::draw::State::reset`):
+/// waiting for an allocation to be refused keeps the cache pinned at the
+/// cap under the thousands of root views a frame. Runs past half the cap
+/// or at the window ceiling; there, every unused window goes regardless of
+/// age. Below that, windows idle for [`idle_frames`] ticks still go.
 /// `VICTORY_IDLE_RECLAIM=0` turns it off.
 pub(crate) fn let_go_idle() {
     if matches!(std::env::var("VICTORY_IDLE_RECLAIM").as_deref(), Ok("0")) {
         return;
     }
-    let (_, max) = card_limits();
-    if SHADOW_BYTES.load(std::sync::atomic::Ordering::Relaxed) < 3 * max / 4 {
-        return;
-    }
-    let tick = IDLE_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-    let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
-    let mut used = LOOSE_USED.lock().unwrap_or_else(|e| e.into_inner());
-    let mut freed = 0u64;
-    map.retain(|key, shadow| {
-        let idle = tick.saturating_sub(used.get(key).copied().unwrap_or(tick)) >= IDLE_FRAMES
-            && Arc::strong_count(shadow) == 1
-            && shadow.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
-        if idle {
-            freed += shadow.len;
-            false
-        } else {
-            true
-        }
-    });
+    IDLE_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let count = loose_len();
+    let over = count >= window_limit();
+    let pressured = SHADOW_BYTES.load(std::sync::atomic::Ordering::Relaxed) >= reclaim_at() || over;
+    let (age, limit) = if pressured {
+        (0, over.then_some(window_limit().saturating_sub(1)))
+    } else {
+        (idle_frames(), None)
+    };
+    let freed = evict_unused(age, limit);
     if freed > 0 {
-        used.retain(|key, _| map.contains_key(key));
-        tracing::info!(freed_mb = freed >> 20, "released idle title-memory windows");
+        tracing::info!(
+            freed_mb = freed >> 20,
+            live_mb = SHADOW_BYTES.load(std::sync::atomic::Ordering::Relaxed) >> 20,
+            windows = loose_len(),
+            "released idle title-memory windows"
+        );
     }
 }
 
@@ -1177,6 +1306,20 @@ pub(crate) fn log_views(frames: f64) {
             outside as f64 / frames,
             over_buffer as f64 / frames,
             over_window as f64 / frames
+        );
+    }
+    // The window cache itself: a count and byte total per frame, so a
+    // leak/race shows up as growth before `shared_buffer` starts to fail.
+    let (windows, bytes) = {
+        let map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        (map.len(), map.values().map(|s| s.len).sum::<u64>())
+    };
+    if windows > 0 {
+        tracing::info!(
+            "loose windows: {windows}/{} ({:.1} MiB, shadow total {:.1} MiB)",
+            window_limit(),
+            bytes as f64 / (1 << 20) as f64,
+            SHADOW_BYTES.load(Relaxed) as f64 / (1 << 20) as f64
         );
     }
 }
@@ -1304,6 +1447,36 @@ mod tests {
             !in_buffer(&map, address),
             "the wide buffer is past the 64 nearer entries"
         );
+    }
+
+    /// A loose window is shared per 1 MiB cell, covers the view's reach (so
+    /// a view near the end of a cell does not fault), and never grows to the
+    /// 8 MiB a 4 MiB cell doubled into. A constant view's 64 KiB reach gets
+    /// a whole cell of slack.
+    #[test]
+    fn loose_windows_cover_reach_without_doubling() {
+        let mib = 1 << 20;
+        // A constant view in the middle of a cell: one cell, not 4 or 8 MiB.
+        let address = 3 * mib + 0x8000;
+        let (start, len) = window_for(address, address + (64 << 10)).expect("a window");
+        assert_eq!((start, len), (3 * mib, mib));
+        assert!(start + len >= address + (64 << 10), "the reach fits");
+
+        // A 1 MiB reach that crosses the cell's end: two cells, not four.
+        let address = 3 * mib + mib / 2;
+        let (start, len) = window_for(address, address + mib).expect("a window");
+        assert_eq!((start, len), (3 * mib, 2 * mib));
+        assert!(start + len >= address + mib, "the reach still fits");
+        assert!(len <= 2 * mib, "no 8 MiB window");
+
+        // Every other view in the same cell shares the very same window.
+        let other = 3 * mib + mib / 2 + 0x1000;
+        assert_eq!(window_for(other, other + mib), Some((start, len)));
+
+        // An address at a cell start reaches exactly one cell.
+        assert_eq!(window_for(4 * mib, 4 * mib + mib), Some((4 * mib, mib)));
+        // Overflow is refused rather than wrapping into a tiny window.
+        assert_eq!(window_for(u64::MAX - 8, u64::MAX), None);
     }
 
     /// The title writes a constant under a range an earlier list of the

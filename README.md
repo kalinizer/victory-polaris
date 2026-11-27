@@ -355,7 +355,10 @@ Switches below are off when unset or `0`, unless the row says otherwise.
 | `VICTORY_CARD_BUFFERS_MB=<n>` | cap on host copies of title buffers |
 | `VICTORY_CARD_BUFFERS_MIN_KB=<n>` | copies smaller than this bypass the cap — set low to make the cap effective |
 | `VICTORY_SNAPSHOT_POOL_MIB=<n>` | snapshot buffers kept for reuse (default 512 MiB, was hardcoded 2 GiB; 0 disables reuse) — lowers resident memory on 16 GB machines |
-| `VICTORY_IDLE_RECLAIM=0` | turn off the periodic release of idle title-memory shadow windows (on by default; reclaim starts past three quarters of `VICTORY_CARD_BUFFERS_MB`) |
+| `VICTORY_IDLE_RECLAIM=0` | turn off the periodic release of idle title-memory shadow windows (on by default; reclaim starts past **half** of `VICTORY_CARD_BUFFERS_MB`, or at the window ceiling, and then drops every unused window) |
+| `VICTORY_IDLE_FRAMES=<n>` | ticks without a use before a window goes when there is no pressure (default 2; was 4) |
+| `VICTORY_ROOT_VIEW_WINDOWS=<n>` | hard ceiling on live loose root-view windows, with oldest-used eviction (default 256) |
+| `VICTORY_ROOT_VIEW_MB=<n>` | cap on the bytes refreshed per root view (default **1** MiB). `0` explicitly means unlimited (refresh to the copy's end): risky here — it made ~1000 root views/frame copy ~1.3 GB/frame and fail with `0x8007000E`. A positive value larger than 1 may be needed if a shader's data sits past the first MiB |
 | `VICTORY_RENDER_SCALE=<factor>` | shrink the **swap chain** only (`0.5`, `0.75`; `1`/unset keeps the title's size). The title still renders into its own targets, so this saves swap-chain memory and sampling work, **not** the 7+ GB of host textures. A scaled single plane goes through the sampling compositor instead of `CopyResource` |
 | `VICTORY_TEXTURE_MAX=<pixels>` | cap a sampled host texture's largest side by leaving out its top mips (power-of-two 2D sampled textures only; never below 256 px). `auto` = 1024, dropping to 512 above 92% and 256 above 97% of the card's DXGI budget. Unset: title sizes unchanged. The largest memory win |
 | `VICTORY_TEXTURE_MB=<n>` | per-texture host allocation budget in MiB, clamped to VRAM/4 (the small-VRAM preset rule). Top mips are left out until the estimated allocation fits; combines with `VICTORY_TEXTURE_MAX`. Unset: no byte budget |
@@ -370,12 +373,24 @@ exact console mip footprint. What *can* be reduced is the host side. To aim
 at a 1080p image on the 8 GB card, start with:
 
 ```powershell
-$env:VICTORY_CARD_BUFFERS_MIN_KB = '4'      # make the cap apply to 4 MiB windows
+$env:VICTORY_CARD_BUFFERS_MIN_KB = '4'      # make the cap apply to loose windows
 $env:VICTORY_CARD_BUFFERS_MB     = '768'    # 256-768 MiB, not the README's 4096
 $env:VICTORY_SNAPSHOT_POOL_MIB   = '64'     # shadow snapshots, was 512 (hardcoded 2 GiB)
 $env:VICTORY_TEXTURE_MAX         = '1024'   # try 'auto' for 1024/512/256 VRAM tiers
 $env:VICTORY_RENDER_SCALE        = '0.75'   # or 0.5; swap chain only
+$env:VICTORY_ROOT_VIEW_MB        = '1'      # default now; 0 = unlimited, do not use here
+$env:VICTORY_ROOT_VIEW_WINDOWS   = '256'    # default; loose windows are 1-2 MiB now
+$env:VICTORY_IDLE_FRAMES         = '2'      # default; 1 is more aggressive
 ```
+
+The root-view refresh cap is the single biggest CPU/memory lever: with
+`VICTORY_ROOT_VIEW_MB=0` (the former unlimited default) the crashed run copied
+~1.3 GB/frame into ~1000 root views, took ~57k page faults/frame, and died
+with `0x8007000E` in `shared_buffer`. The default is 1 MiB again. Loose
+windows are also 1-2 MiB instead of 4-8 MiB, capped at 256 by default and
+reclaimed at half the shadow budget. The logs report `loose windows: n/m
+(x MiB, shadow total y MiB)` once a frame (diagnostics build) — watch that
+line for growth before another allocation failure.
 
 `VICTORY_TEXTURE_MAX=512` is the next step if the working set still grows;
 it quarters the bytes of every capped texture again. Quality drops with the
