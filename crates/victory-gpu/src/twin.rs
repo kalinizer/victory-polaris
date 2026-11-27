@@ -139,7 +139,7 @@ fn make(console: u32, depth: &ID3D12Resource) -> Option<Twin> {
         }
         let texture = texture?;
         crate::host::name(&texture, || format!("depth twin {}x{} f{f}", dd.Width, dd.Height));
-        planes.push(Arc::new(HostTexture::new(texture, 0, Vec::new(), false)));
+        planes.push(Arc::new(HostTexture::new(texture, 0, Vec::new(), false, 0)));
     }
     // The depth texture's footprints, every plane, and the twin's.
     let n = subs * planes.len() as u32;

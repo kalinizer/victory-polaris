@@ -749,6 +749,74 @@ fn uav_desc(words: &[u32; 10]) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
     }
 }
 
+/// With the opt-in float substitution, name the stand-in in a view over a
+/// stand-in host texture: the title asks for R9G9B9E5 (67), typeless 16-bit
+/// (9) or the R32_UINT (42) it packed the light into, all of which are
+/// RGBA16F on the host. The resource, view and pipeline then agree.
+fn subst_format(texture: &ID3D12Resource, format: &mut DXGI_FORMAT) {
+    // SAFETY: a live resource, plain query.
+    let host = unsafe { texture.GetDesc() }.Format.0 as u32;
+    let named = crate::resource::stand_in_view_format(host, format.0 as u32);
+    if named != format.0 as u32 {
+        *format = DXGI_FORMAT(named as i32);
+    }
+}
+
+/// A view without a description of a typeless texture, with the typed
+/// format the substitution picked (`resource::default_shader_format`): the
+/// host refuses typeless SRV/UAV views. Only the dimensions matter here;
+/// the whole chain and every slice are viewed, as the title's null view did.
+fn default_srv(texture: &ID3D12Resource, format: DXGI_FORMAT) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
+    // SAFETY: a live resource, plain query.
+    let d = unsafe { texture.GetDesc() };
+    let mut desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: format,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        ..Default::default()
+    };
+    match d.Dimension {
+        D3D12_RESOURCE_DIMENSION_TEXTURE1D => {
+            desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1D;
+            desc.Anonymous.Texture1D.MipLevels = u32::MAX;
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE2D if d.SampleDesc.Count > 1 => {
+            desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE2D => {
+            desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            desc.Anonymous.Texture2D.MipLevels = u32::MAX;
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE3D => {
+            desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+            desc.Anonymous.Texture3D.MipLevels = u32::MAX;
+        }
+        _ => {}
+    }
+    desc
+}
+
+fn default_uav(texture: &ID3D12Resource, format: DXGI_FORMAT) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
+    // SAFETY: a live resource, plain query.
+    let d = unsafe { texture.GetDesc() };
+    let mut desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        Format: format,
+        ..Default::default()
+    };
+    match d.Dimension {
+        D3D12_RESOURCE_DIMENSION_TEXTURE1D => {
+            desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE1D;
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE2D => {
+            desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE3D => {
+            desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+        }
+        _ => {}
+    }
+    desc
+}
+
 /// The byte stride of a buffer view (its element size, at least 1), 0 for
 /// other views: what the view-stride table holds for it.
 fn view_stride(view: &View) -> u32 {
@@ -1139,8 +1207,25 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             if let Some(copy) = crate::resource::host_copy(resource) {
                 let texture = &copy.texture;
                 let mut desc = desc.as_ref().map(srv_desc);
-                if desc.is_none() && !default_view(resource) {
-                    return None;
+                // A capped texture's host chain starts at the title's mip
+                // `mip_drop`: shift any explicit window onto it. A null
+                // description views the whole (already smaller) resource.
+                if let Some(d) = desc.as_mut() && copy.mip_drop > 0 {
+                    // SAFETY: a plain query on a live resource.
+                    let host_mips = unsafe { texture.GetDesc() }.MipLevels;
+                    crate::resource::rebase_srv_mips(d, copy.mip_drop, u32::from(host_mips));
+                }
+                if desc.is_none() {
+                    // SAFETY: a live resource, plain query.
+                    let host = unsafe { texture.GetDesc() }.Format.0 as u32;
+                    if let Some(format) = crate::resource::default_shader_format(host) {
+                        desc = Some(default_srv(texture, DXGI_FORMAT(format as i32)));
+                    } else if !default_view(resource) {
+                        return None;
+                    }
+                }
+                if let Some(d) = desc.as_mut() {
+                    subst_format(texture, &mut d.Format);
                 }
                 if !fits(texture, &copy.castable, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
@@ -1180,8 +1265,17 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     .map(|twin| Some((twin, None)));
             }
             let mut desc = desc.as_ref().map(uav_desc);
-            if desc.is_none() && !default_view(resource) {
-                return None;
+            if desc.is_none() {
+                // SAFETY: a live resource, plain query.
+                let host = unsafe { texture.GetDesc() }.Format.0 as u32;
+                if let Some(format) = crate::resource::default_shader_format(host) {
+                    desc = Some(default_uav(texture, DXGI_FORMAT(format as i32)));
+                } else if !default_view(resource) {
+                    return None;
+                }
+            }
+            if let Some(d) = desc.as_mut() {
+                subst_format(texture, &mut d.Format);
             }
             if !fits(texture, &copy.castable, desc.as_mut().map(|d| &mut d.Format), true) {
                 return None;

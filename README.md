@@ -311,7 +311,7 @@ base commit and are not regressions. Otherwise: 251 passed, 3 ignored.
 ## Debugging switches
 
 Build them in with `cargo build --profile diag -p victory --features diagnostics`.
-Switches below are off when unset or `0`.
+Switches below are off when unset or `0`, unless the row says otherwise.
 
 | Variable | Effect |
 |----------|--------|
@@ -342,7 +342,7 @@ Switches below are off when unset or `0`.
 | `VICTORY_PRESENT_LAST_TARGET` | substitute the frame's last draw target for PresentX plane 0 as the compositor's opaque base (opt-in experiment — **does not work on this tree**: the target is a 3840×2160 UI plane and the compositor produces an invalid command / `0x80004005`; keep off) |
 | `VICTORY_PRESENT_SUBRES` | single-plane present copies subresource 0 with `CopyTextureRegion` instead of `CopyResource` (upstream #3257 experiment) |
 | `VICTORY_ROOT_SIG_FALLBACK=1` | retry root signature serialization and creation without directly-indexed heap flags (0xC01/0xC00) if the host runtime rejects them; warns once with the flags and error (upstream #626 experiment) |
-| `VICTORY_LOG_PLANES` | with `VICTORY_CAPTURE`, log each present plane's index/count/dimensions/format and the last draw target's dimensions |
+| `VICTORY_LOG_PLANES` | with `VICTORY_CAPTURE`, log each present plane's index/count/dimensions/format and the last draw target's dimensions; also logs the compositor's actual swap-chain size/format and each plane's SRV format (once per change, no capture needed) |
 | `VICTORY_SCREEN_PIPELINES` | give no-input/no-depth fullscreen pipelines a separate queue and a 20 s wait budget, so one-shot lighting tables are not starved behind world pipelines (upstream #2435 experiment) |
 | `VICTORY_AMBIENT=<share>` | scene-derived indirect light stand-in: a positive number is the share of the estimate (`0.6` default/unset, `0.8` tuned in the AMD fork), `off`/`0` disables; `constant:<level>` is the old flat constant. The estimate follows the title's `CS_CacheScreenSpaceRadiance` output and scene depth, and filters the magenta garbage probes left by uninitialized memory on AMD |
 | `VICTORY_AMBIENT_SHADE=<strength>,<radius>` | creases' shade (default `1.0,0.6`) |
@@ -350,11 +350,40 @@ Switches below are off when unset or `0`.
 | `VICTORY_AMBIENT_AIR=<multiple>` | cap what the air scatters by a multiple of the light around (off by default) |
 | `VICTORY_FALLBACK_HEAPS=1` | bind one-slot shader-visible host view/sampler heaps where a list sets none, for directly-indexed root signatures (a UI draw that sets no heaps otherwise samples null descriptors and shows a flat gradient) |
 | `VICTORY_PRESENT_ALL_RESOURCES=1` | show every resource listed by a PresentX plane, not just the first (planes here have `count=1`, so this changes nothing on this title — kept as a diagnostic) |
+| `VICTORY_PRESENT_BASE_SIZE` | compose at the base plane's size (on by default here, for a 1080p display); `=0` restores the largest-plane size, which scales the 1080p scene to 4K and blurs the UI |
+| `VICTORY_PRESENT_SHADER_COMBINE=1` | for exactly two planes, combine scene and UI in one shader draw (mip 0, saturated premultiplied alpha, opaque output) instead of two draws with target blending |
 | `VICTORY_CARD_BUFFERS_MB=<n>` | cap on host copies of title buffers |
 | `VICTORY_CARD_BUFFERS_MIN_KB=<n>` | copies smaller than this bypass the cap — set low to make the cap effective |
 | `VICTORY_SNAPSHOT_POOL_MIB=<n>` | snapshot buffers kept for reuse (default 512 MiB, was hardcoded 2 GiB; 0 disables reuse) — lowers resident memory on 16 GB machines |
+| `VICTORY_IDLE_RECLAIM=0` | turn off the periodic release of idle title-memory shadow windows (on by default; reclaim starts past three quarters of `VICTORY_CARD_BUFFERS_MB`) |
+| `VICTORY_RENDER_SCALE=<factor>` | shrink the **swap chain** only (`0.5`, `0.75`; `1`/unset keeps the title's size). The title still renders into its own targets, so this saves swap-chain memory and sampling work, **not** the 7+ GB of host textures. A scaled single plane goes through the sampling compositor instead of `CopyResource` |
+| `VICTORY_TEXTURE_MAX=<pixels>` | cap a sampled host texture's largest side by leaving out its top mips (power-of-two 2D sampled textures only; never below 256 px). `auto` = 1024, dropping to 512 above 92% and 256 above 97% of the card's DXGI budget. Unset: title sizes unchanged. The largest memory win |
+| `VICTORY_TEXTURE_MB=<n>` | per-texture host allocation budget in MiB, clamped to VRAM/4 (the small-VRAM preset rule). Top mips are left out until the estimated allocation fits; combines with `VICTORY_TEXTURE_MAX`. Unset: no byte budget |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | record what the title plays |
 | `VICTORY_XMA_DUMP=<dir>` | save the first 32 XMA voices' context and input |
+
+### Memory switches for this card (opt-in)
+
+The title's own render targets cannot be resized from the host: their sizes
+are written into its texture/streaming tables and its detiler expects the
+exact console mip footprint. What *can* be reduced is the host side. To aim
+at a 1080p image on the 8 GB card, start with:
+
+```powershell
+$env:VICTORY_CARD_BUFFERS_MIN_KB = '4'      # make the cap apply to 4 MiB windows
+$env:VICTORY_CARD_BUFFERS_MB     = '768'    # 256-768 MiB, not the README's 4096
+$env:VICTORY_SNAPSHOT_POOL_MIB   = '64'     # shadow snapshots, was 512 (hardcoded 2 GiB)
+$env:VICTORY_TEXTURE_MAX         = '1024'   # try 'auto' for 1024/512/256 VRAM tiers
+$env:VICTORY_RENDER_SCALE        = '0.75'   # or 0.5; swap chain only
+```
+
+`VICTORY_TEXTURE_MAX=512` is the next step if the working set still grows;
+it quarters the bytes of every capped texture again. Quality drops with the
+top mips (fine detail / distant surfaces get softer), so do not go below 256
+on this title. On 16 GB RAM the paging file was deliberately left at the
+Windows default; a large `--console series-s` profile plus these caps is the
+only way this card has been kept inside its budget. `VICTORY_TEXTURE_MB=1536`
+(VRAM/4 on an 8 GB card) is an alternative byte-budget form of the same cap.
 
 Every build appends unhandled exceptions, panics and host GPU failures to
 `crashes.log` in the title's data folder.

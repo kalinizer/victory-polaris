@@ -28,6 +28,12 @@
 //! `VICTORY_AMBIENT_SHADE=<strength>,<radius in metres>` sets the creases;
 //! `VICTORY_AMBIENT_SETTLE=<ms>[,<jump>[,<fresh s>]]` the slow mean;
 //! `VICTORY_AMBIENT_AIR=<multiple>` bounds what the air scatters.
+//!
+//! With `VICTORY_LIGHT_FORMAT_FLOAT=1` the light image is hosted as
+//! R16G16B16A16_FLOAT rather than R9G9B9E5 packed in R32_UINT. The `raise`
+//! program then stores float3 light directly ([`crate::resource::
+//! light_float_format`]); without the switch it keeps packing the shared
+//! exponent, byte for byte as before.
 
 use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -72,6 +78,23 @@ pub(crate) const DEPTH: (u8, u32) = (0, 464);
 pub(crate) const RADIANCE: (u8, u32) = (1, 16);
 /// Where the light the air scatters is.
 pub(crate) const AIR: (u8, u32) = (1, 32);
+
+/// Host format of the resolve's light image our `raise` writes: R32_UINT
+/// (42) with packed R9G9B9E5 normally, RGBA16F (10) under
+/// `VICTORY_LIGHT_FORMAT_FLOAT=1`.
+pub(crate) fn light_format() -> u32 {
+    if crate::resource::light_float_format() { 10 } else { 42 }
+}
+
+/// Whether a resolve light image has the format our `raise` writes. Use
+/// this at the dispatch check so the float program is only dispatched at
+/// an image that can hold floats. `draw.rs`'s dispatch gate lives with the
+/// other host-side changes; this predicate is kept here next to the
+/// program that needs it.
+#[allow(dead_code)]
+pub(crate) fn light_format_ok(format: u32) -> bool {
+    format == light_format()
+}
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Set {
@@ -292,6 +315,13 @@ void clear_air(uint3 at : SV_DispatchThreadID) {
 #endif
 
 #ifdef RAISE
+#ifdef FLOAT_LIGHT
+// Opt-in: the host texture is RGBA16F, so light is a float3, not a packed
+// R9G9B9E5 word. No shared exponent to unpack or repack.
+RWTexture2D<float4> light : register(u0);
+float3 unpack(float4 v) { return v.rgb; }
+float4 pack(float3 c) { return float4(min(max(c, 0.0), 65504.0), 1.0); }
+#else
 RWTexture2D<uint> light : register(u0);
 float3 unpack(uint v) {
     return float3(v & 511, (v >> 9) & 511, (v >> 18) & 511) * exp2(float(v >> 27) - 24.0);
@@ -305,6 +335,7 @@ uint pack(float3 c) {
     uint3 m = min(uint3(c * scale + 0.5), 511u);
     return m.r | (m.g << 9) | (m.b << 18) | (uint(e) << 27);
 }
+#endif
 [RootSignature(RS)]
 [numthreads(8, 8, 1)]
 void raise(uint3 at : SV_DispatchThreadID) {
@@ -386,6 +417,9 @@ struct Pass {
     place: ID3D12PipelineState,
     gather: ID3D12PipelineState,
     raise: ID3D12PipelineState,
+    /// The same program storing float3 into an RGBA16F light image, under
+    /// `VICTORY_LIGHT_FORMAT_FLOAT`; `None` when the switch is off.
+    raise_float: Option<ID3D12PipelineState>,
     air: ID3D12PipelineState,
     cells: ID3D12Resource,
     points: ID3D12Resource,
@@ -418,6 +452,11 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
     let place = pipeline("PLACE", s!("place"))?;
     let gather = pipeline("GATHER", s!("gather"))?;
     let raise = pipeline("RAISE", s!("raise"))?;
+    let raise_float = if crate::resource::light_float_format() {
+        Some(pipeline("RAISE\n#define FLOAT_LIGHT", s!("raise"))?)
+    } else {
+        None
+    };
     let air = pipeline("AIR", s!("clear_air"))?;
     let made = |bytes| buffer(bytes).ok_or_else(windows::core::Error::empty);
     Ok(Pass {
@@ -427,6 +466,7 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
         place,
         gather,
         raise,
+        raise_float,
         air,
         cells: made(CELL_BYTES)?,
         points: made(POINT_BYTES)?,
@@ -539,7 +579,14 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
                     run(&pass.place, 8, 9, 1);
                     run(&pass.gather, 20, 45, 1);
                 }
-                run(&pass.raise, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
+                // Under the opt-in substitution the light image is RGBA16F:
+                // store float3 light, not a packed R9G9B9E5 word.
+                let raise = if light_format() == 10 {
+                    pass.raise_float.as_ref().unwrap_or(&pass.raise)
+                } else {
+                    &pass.raise
+                };
+                run(raise, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
             }
         }
     }
@@ -549,6 +596,13 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn light_image_format_follows_the_float_switch() {
+        assert!(!crate::resource::light_float_format());
+        assert!(light_format_ok(42));
+        assert!(!light_format_ok(10));
+    }
 
     #[test]
     fn settings() {
@@ -566,6 +620,21 @@ mod tests {
         assert_eq!(role(b"..CS_CacheScreenSpaceRadiance_eed2fc35.."), Some(Role::Radiance));
         assert_eq!(role(b"CS_AccumulateLocalLightInscatteringVolume_7e2f5eef"), Some(Role::Air));
         assert_eq!(role(b"CS_TemporalResolve"), None);
+    }
+
+    /// The float-light variant of `raise` really compiles: the switch only
+    /// decides which one is dispatched, both must be valid HLSL.
+    #[test]
+    fn the_float_light_raise_builds() {
+        let Some(_host) = host() else {
+            return;
+        };
+        crate::host::compile(
+            &format!("#define RAISE\n#define FLOAT_LIGHT\n{SOURCE}"),
+            s!("raise"),
+            s!("cs_5_1"),
+        )
+        .expect("the float-light raise program");
     }
 
     /// The passes compile with the system's compiler and the host takes them.

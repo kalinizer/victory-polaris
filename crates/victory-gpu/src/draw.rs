@@ -108,8 +108,10 @@ pub(crate) struct State {
     /// and its view heap.
     memory: Option<(usize, crate::memory::Map)>,
     /// Views made for root SRVs and UAVs in this list ([`State::root_view`]):
-    /// (view heap, host copy, unordered access) → dynamic slot.
-    root_slots: std::collections::HashMap<(usize, usize, bool), u32>,
+    /// (view heap, host copy, unordered access, no-copy fallback) → dynamic
+    /// slot. The last field keeps fallback views (keyed by title address)
+    /// distinct from a host copy that happens to have the same id.
+    root_slots: std::collections::HashMap<(usize, usize, bool, bool), u32>,
     /// The run of dynamic slots root views take from (view heap, next
     /// slot, end): taken [`ROOT_VIEW_RUN`] at a time, so that single slots
     /// do not break up the runs fresh tables need.
@@ -216,10 +218,11 @@ pub(crate) fn dispatched() -> u64 {
 /// shortcut: a root view has no size; constant buffers are taken as 64 KiB,
 /// other views as 1 MiB (both cut at their buffer's end).
 fn root_view(list: &HostList, address: u64, srv: bool, uav: bool) -> Option<u64> {
-    let shadow = crate::shadow::find(address, 1)?;
+    let reach = if srv || uav { 1 << 20 } else { 1 << 16 };
+    let shadow = crate::shadow::find_reaching(address, reach)?;
     let len = shadow
         .left(address)
-        .min(if srv || uav { 1 << 20 } else { 1 << 16 });
+        .min(if srv || uav { root_view_limit() } else { 1 << 16 });
     let gpu = shadow.gpu(address);
     if srv || uav || gpu % 256 == 0 {
         shadow.refresh(list, address, len);
@@ -252,6 +255,9 @@ fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
 
 impl State {
     pub(crate) fn reset(&mut self, pipeline: This) {
+        // Before recording a new list: its submissions have run, so any
+        // window no list or slot still holds can be released.
+        crate::shadow::let_go_idle();
         *self = State::default();
         self.pipeline = pipeline as usize;
     }
@@ -802,8 +808,15 @@ impl State {
                     None if u.dword == victory_shader::emit::ROOT_VIEW_OFFSET => {
                         // Where the root address lies in the copy its view shows.
                         let offset = match self.roots_ref(title_compute).get(usize::from(u.slot)) {
-                            Some(&Root::View(address)) => crate::shadow::find(address, 1)
-                                .and_then(|s| u32::try_from(s.offset(address)).ok()),
+                            Some(&Root::View(address)) => {
+                                match crate::shadow::find_reaching(address, 1 << 20) {
+                                    Some(shadow) => u32::try_from(shadow.offset(address)).ok(),
+                                    // `State::root_view` views the fallback
+                                    // bytes from the address itself.
+                                    None if root_view_fallback() => Some(0),
+                                    None => None,
+                                }
+                            }
                             _ => None,
                         };
                         match offset {
@@ -969,14 +982,30 @@ impl State {
             );
             return None;
         };
-        let shadow = crate::shadow::find(address, 1)?;
-        let offset = u32::try_from(shadow.offset(address)).ok()?;
-        shadow.refresh(list, address, shadow.left(address));
-        if uav {
-            // Writes through the view are marked wherever they land in the
-            // copy; else declared for 1 MiB.
-            let len = if shadow.marked() { shadow.left(address) } else { shadow.left(address).min(1 << 20) };
-            shadow.gpu_writes(list, address, len, true);
+        let reach = if uav { 1 << 20 } else { 1 << 16 };
+        let shadow = crate::shadow::find_reaching(address, reach);
+        let offset = match shadow.as_ref() {
+            Some(shadow) => match u32::try_from(shadow.offset(address)) {
+                Ok(offset) => offset,
+                Err(_) => return None,
+            },
+            // The fallback view below starts at the title address, so the
+            // shader's offsets from it are unchanged.
+            None if root_view_fallback() => 0,
+            None => return None,
+        };
+        if let Some(shadow) = &shadow {
+            // `reach` only sizes the window to ask for; the view itself is
+            // unbounded. By default refresh to the end of the copy: a
+            // shader's vertex streams can sit past the first 1 MiB.
+            let len = shadow.left(address).min(root_view_limit());
+            shadow.refresh(list, address, len);
+            if uav {
+                // Writes through the view are marked wherever they land in the
+                // copy; else declared for 1 MiB.
+                let len = if shadow.marked() { shadow.left(address) } else { shadow.left(address).min(1 << 20) };
+                shadow.gpu_writes(list, address, len, true);
+            }
         }
         let (key, host) = match self.heaps[0] {
             0 => (MEMORY_HEAP, crate::memory::heap()?),
@@ -985,8 +1014,11 @@ impl State {
                 crate::descriptor::heap(h as This).host()?,
             ),
         };
-        let copy = std::sync::Arc::as_ptr(&shadow) as usize;
-        if let Some(&index) = self.root_slots.get(&(key, copy, uav)) {
+        let (copy, fallback) = match &shadow {
+            Some(shadow) => (std::sync::Arc::as_ptr(shadow) as usize, false),
+            None => (address as usize, true),
+        };
+        if let Some(&index) = self.root_slots.get(&(key, copy, uav, fallback)) {
             return Some((index, offset));
         }
         let (run_heap, next, end) = self.root_run;
@@ -1001,11 +1033,36 @@ impl State {
         let index = self.root_run.1;
         self.root_run.1 += 1;
         ROOT_VIEW_SLOTS.fetch_add(1, Ordering::Relaxed);
-        host.raw_view_at(index, Some(&shadow.buffer), 0, shadow.range().1 & !3, uav);
-        if uav {
-            host.set_mark(index, shadow.mark_entry(shadow.range().0));
+        match &shadow {
+            Some(shadow) => {
+                host.raw_view_at(index, Some(&shadow.buffer), 0, shadow.range().1 & !3, uav);
+                if uav {
+                    host.set_mark(index, shadow.mark_entry(shadow.range().0));
+                }
+            }
+            None => {
+                // No host copy: fill a small UAV-capable buffer from title
+                // memory at submission and view that, so the shader reads
+                // real data and a UAV write has somewhere safe to go (it is
+                // discarded rather than copied back). A null raw *buffer*
+                // view is the last resort; a texture null would be rejected
+                // by the debug layer. Neither drops the dispatch.
+                let bytes = (1 << 20) & !3;
+                match crate::host::host().and_then(|h| h.shared_buffer(bytes)) {
+                    Some((buffer, data)) => {
+                        list.keep(&buffer);
+                        list.defer_fill(data, address as *const u8, bytes as usize);
+                        host.raw_view_at(index, Some(&buffer), 0, bytes, uav);
+                        once!(slot, address, "a root view has no copy: using a filled sink view");
+                    }
+                    None => {
+                        host.raw_view_at(index, None, 0, 0, uav);
+                        once!(slot, address, "a root view has no copy: using a null raw view");
+                    }
+                }
+            }
         }
-        self.root_slots.insert((key, copy, uav), index);
+        self.root_slots.insert((key, copy, uav, fallback), index);
         Some((index, offset))
     }
 
@@ -1200,7 +1257,11 @@ impl State {
             return false;
         };
         // R32_UINT holding R9G9B9E5; R11G11B10_FLOAT.
-        let format = if role == Role::Resolve { 42 } else { 26 };
+        let format = if role == Role::Resolve {
+            crate::ambient::light_format() as i32
+        } else {
+            26
+        };
         let volume = of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
         if of.Format.0 != format
             || (seen.Width, seen.Height) != (of.Width, of.Height)
@@ -2599,6 +2660,30 @@ fn describe(view: Option<&View>) -> String {
         }
         Some(v) => format!("{v:?}").chars().take(60).collect(),
     }
+}
+
+/// Whether a root view whose title memory has no host copy may still be
+/// given a view instead of dropping the draw (`VICTORY_ROOT_VIEW_FALLBACK=0`
+/// restores the old, strict behaviour). A raw view of a filled buffer, or a
+/// null raw buffer view if even that cannot be made, keeps the dispatch
+/// running; a null UAV is never used (atomic loops would hang the GPU).
+fn root_view_fallback() -> bool {
+    !matches!(std::env::var("VICTORY_ROOT_VIEW_FALLBACK").as_deref(), Ok("0"))
+}
+
+/// Bytes of title memory a root view brings up to date (`VICTORY_ROOT_VIEW_MB`).
+/// Unset or `0` reaches the end of the copy: the old 1 MiB cut left meshes
+/// without bodies (vertex streams past the first MiB). A positive value caps
+/// the refresh, for runs where copying whole windows costs too much.
+fn root_view_limit() -> u64 {
+    static BYTES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| {
+        std::env::var("VICTORY_ROOT_VIEW_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&n| n > 0)
+            .map_or(u64::MAX, |n| n.saturating_mul(1 << 20))
+    })
 }
 
 /// A user-data entry that takes the heap index of a root view's view.

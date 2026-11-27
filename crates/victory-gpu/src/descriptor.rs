@@ -295,6 +295,10 @@ impl RtvRecord {
                 0,
             ]
         };
+        // Opt-in packed-light substitution: the host cannot make an RTV/DSV
+        // of typeless 16-bit-per-channel R16G16B16A16_TYPELESS (9), so name
+        // RGBA16F (10) as the typed view when the switch is on.
+        words[0] = crate::resource::default_shader_format(words[0]).unwrap_or(words[0]);
         // Upstream #3436: a described RTV/DSV that leaves the format UNKNOWN
         // on a typeless (sRGB+UAV) host copy makes D3D12 refuse the view and
         // the target reads black. Name the title's own format instead.

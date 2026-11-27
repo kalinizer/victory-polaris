@@ -462,6 +462,20 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
         ) {
+            // `VICTORY_TEXTURE_MAX` gives the two host chains possibly
+            // different mip windows. CopyResource needs matching extents;
+            // a mixed pair is skipped rather than sent as an invalid copy.
+            let (to_drop, from_drop) = (
+                crate::resource::host_copy(dst).map_or(0, |c| c.mip_drop),
+                crate::resource::host_copy(src).map_or(0, |c| c.mip_drop),
+            );
+            if to_drop != from_drop {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::warn!(to_drop, from_drop, "copy between differently capped textures skipped (VICTORY_TEXTURE_MAX)")
+                });
+                return;
+            }
             if crate::texture::title_written(from) {
                 crate::texture::upload(list, src, from);
             }
@@ -534,6 +548,22 @@ extern "system" fn copy_texture_region(
             ONCE.call_once(|| tracing::warn!("texture to buffer copies not implemented"));
             return;
         };
+        // Title subresource indices name the title's mip chain; with a cap,
+        // the host's chain starts `mip_drop` levels later.
+        let to_drop = crate::resource::host_copy(dst.resource).map_or(0, |c| c.mip_drop);
+        let from_drop = crate::resource::host_copy(src.resource).map_or(0, |c| c.mip_drop);
+        // A dropped level has no host copy: drop that copy rather than
+        // redirecting it onto the wrong mip. Validate before changing state.
+        let sub = |drop: u32, kind: u32, location: &CopyLocation| {
+            (kind != 0).then_some(0).or_else(|| {
+                crate::resource::host_subresource(drop, location.footprint.offset as u32)
+            })
+        };
+        let (Some(to_sub), Some(from_sub)) =
+            (sub(to_drop, dst.kind, &dst), sub(from_drop, src.kind, &src))
+        else {
+            return;
+        };
         let mut from = src;
         let _upload; // keeps the source alive while this call records it
         #[cfg(feature = "diagnostics")]
@@ -568,11 +598,17 @@ extern "system" fn copy_texture_region(
             }
             ensure_state(list, src.resource, COPY_SOURCE);
             from.resource = texture.as_raw().cast_const().cast();
+            if src.kind == 0 {
+                from.footprint.offset = u64::from(from_sub);
+            }
         }
         ensure_state(list, dst.resource, COPY_DEST);
         crate::texture::host_written(dst.resource);
         let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();
+        if dst.kind == 0 {
+            to_location.footprint.offset = u64::from(to_sub);
+        }
         let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
         #[cfg(feature = "diagnostics")]
         {
@@ -652,6 +688,20 @@ extern "system" fn resolve(
         use windows::core::Interface;
         const RESOLVE_DEST: u32 = 0x1000;
         const RESOLVE_SOURCE: u32 = 0x2000;
+        // Title mip indices start at the title's mip 0; a capped host chain
+        // begins later. Drop resolves of levels the host left out.
+        let (Some(dst_sub), Some(src_sub)) = (
+            crate::resource::host_subresource(
+                crate::resource::host_copy(dst).map_or(0, |c| c.mip_drop),
+                dst_sub,
+            ),
+            crate::resource::host_subresource(
+                crate::resource::host_copy(src).map_or(0, |c| c.mip_drop),
+                src_sub,
+            ),
+        ) else {
+            return;
+        };
         ensure_state(list, dst, RESOLVE_DEST);
         ensure_state(list, src, RESOLVE_SOURCE);
         crate::texture::host_written(dst);

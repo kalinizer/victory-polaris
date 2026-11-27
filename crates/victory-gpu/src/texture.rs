@@ -43,8 +43,10 @@ pub(crate) struct Staging {
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
     layout: victory_formats::texture::Layout,
-    /// Mips per array slice.
+    /// Mips per array slice (host mips).
     mips: u32,
+    /// Top title mips left out of the capped host texture.
+    mip_drop: u32,
     memory: *const u8,
     /// The memory's pages changed since detiled (none: not the runtime's
     /// memory, hashed instead).
@@ -362,8 +364,14 @@ impl Staging {
                 std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
             };
             if let Err(e) =
-                self.layout
-                    .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
+                self.layout.detile(
+                    tiled,
+                    mip + self.mip_drop,
+                    slice,
+                    linear,
+                    pitch,
+                    pitch * rows as usize,
+                )
             {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
                 return;
@@ -475,6 +483,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         rows,
         layout,
         mips: u32::from(d.MipLevels),
+        mip_drop: copy.mip_drop,
         memory,
         tracked: crate::watch::track(memory as usize, layout_size, true),
         last: Mutex::default(),

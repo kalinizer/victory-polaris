@@ -15,9 +15,20 @@ pub(crate) fn on(name: &str) -> bool {
     value_is_on(std::env::var_os(name).as_deref())
 }
 
+/// As [`on`], but on when the variable is unset: only `=0` turns it off.
+/// For behaviour we want by default on this tree but can still opt out of.
+fn value_is_on_by_default(value: Option<&OsStr>) -> bool {
+    value.is_none_or(|v| v != "0")
+}
+
+/// Whether `name` switches something on, defaulting to on.
+pub(crate) fn on_by_default(name: &str) -> bool {
+    value_is_on_by_default(std::env::var_os(name).as_deref())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::value_is_on;
+    use super::{value_is_on, value_is_on_by_default};
     use std::ffi::OsStr;
 
     #[test]
@@ -41,5 +52,13 @@ mod tests {
         for value in ["", "true", "yes", "2", "00", " 0", "0 "] {
             assert!(value_is_on(Some(OsStr::new(value))), "{value:?}");
         }
+    }
+
+    #[test]
+    fn default_on_switch_is_only_disabled_by_zero() {
+        assert!(value_is_on_by_default(None));
+        assert!(!value_is_on_by_default(Some(OsStr::new("0"))));
+        assert!(value_is_on_by_default(Some(OsStr::new("1"))));
+        assert!(value_is_on_by_default(Some(OsStr::new("false"))));
     }
 }

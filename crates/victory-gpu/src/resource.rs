@@ -110,6 +110,7 @@ const _: () = assert!(size_of::<HeapDesc>() == 48);
 const _: () = assert!(size_of::<ResourceDesc>() == 56);
 
 const BUFFER: u32 = 1;
+const TEXTURE_2D: u32 = 3;
 const TEXTURE_3D: u32 = 4;
 
 /// Bytes per element and the element's width in texels (4 for block
@@ -138,7 +139,6 @@ pub(crate) fn element(format: u32) -> Option<(u64, u64)> {
 pub(crate) fn texture_layout(desc: &ResourceDesc) -> Option<texture::Texture> {
     use texture::{Dimension, Swizzle, TextureDesc};
     const TEXTURE_1D: u32 = 2;
-    const TEXTURE_2D: u32 = 3;
     const RENDER_TARGET: u32 = 1;
     const DEPTH: u32 = 2;
     let dimension = match desc.dimension {
@@ -237,6 +237,129 @@ pub(crate) fn pc_format(format: u32) -> u32 {
     }
 }
 
+/// The opt-in packed-light format substitution.
+///
+/// `VICTORY_LIGHT_FORMAT_FLOAT=1` makes host render targets and unordered
+/// access textures the title describes as R9G9B9E5_SHAREDEXP (67) be
+/// R16G16B16A16_FLOAT (10) instead, and makes views of such textures name
+/// the same float format. The title packs bounced light and sky probes as
+/// R9G9B9E5 in R32_UINT textures because compute shaders cannot write the
+/// shared-exponent format; on some AMD/Polaris parts that format path reads
+/// back black or corrupt. Keeping the host resource, its views and the
+/// present path in one format (RGBA16F) avoids the broken conversion.
+/// Unset, `0` or `off` keeps the title's formats byte for byte, so nothing
+/// changes for hosts that handle R9G9B9E5 correctly.
+pub(crate) fn light_float_format() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("VICTORY_LIGHT_FORMAT_FLOAT")
+            .is_ok_and(|v| v.trim() == "1" || v.trim().eq_ignore_ascii_case("on"))
+    })
+}
+
+/// Whether the host renders to and stores through typed UAVs of `format`.
+/// A stand-in is only worth using where the host refuses the packed format.
+#[cfg(windows)]
+fn packed_target_supported(format: u32) -> bool {
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        let Some(host) = crate::host::host() else {
+            return false;
+        };
+        let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+            Format: DXGI_FORMAT(format as i32),
+            ..Default::default()
+        };
+        // SAFETY: a plain query into our own structure.
+        let asked = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_SUPPORT,
+                (&raw mut support).cast(),
+                size_of_val(&support) as u32,
+            )
+        };
+        let need1 = D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0
+            | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0;
+        let need2 = D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD.0
+            | D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE.0;
+        let ok = asked.is_ok()
+            && support.Support1.0 & need1 == need1
+            && support.Support2.0 & need2 == need2;
+        tracing::info!(format, supported = ok, "packed-light format support probed");
+        ok
+    })
+}
+
+/// The format of a texture the host renders to or writes as unordered
+/// access, for the title's `format`. Only active with
+/// [`light_float_format`], and only where the host itself refuses the
+/// packed format: R9G9B9E5_SHAREDEXP stands in as R16G16B16A16_FLOAT. The
+/// title's pipelines and views of such a target name the stand-in too
+/// ([`view_format`], the host view checks).
+pub(crate) fn target_format(format: u32) -> u32 {
+    const PACKED: [(u32, u32); 1] = [(67, 10)];
+    if !light_float_format() {
+        return format;
+    }
+    let Some(&(_, stand_in)) = PACKED.iter().find(|&&(f, _)| f == format) else {
+        return format;
+    };
+    #[cfg(windows)]
+    if packed_target_supported(format) {
+        return format;
+    }
+    stand_in
+}
+
+/// Whether `this`'s host copy is in the float stand-in: its texels are not
+/// laid out as the title's, so its views must name the stand-in format too.
+#[cfg(windows)]
+fn stands_in(this: This) -> bool {
+    if this.is_null() {
+        return false;
+    }
+    let r = resource(this);
+    let own = pc_format(r.desc.format);
+    let stand = target_format(own);
+    stand != own
+        && host_resource(this)
+            .is_some_and(|host| unsafe { host.GetDesc() }.Format.0 as u32 == stand)
+}
+
+/// A view format the host must name over a texture in a float stand-in.
+/// The title describes light as R9G9B9E5 (67), writes it through R32_UINT
+/// (42) and reads typeless 9 views; all three name RGBA16F (10) once the
+/// host texture is the stand-in, so the pipeline and the views agree.
+pub(crate) fn stand_in_view_format(host: u32, requested: u32) -> u32 {
+    if !light_float_format() {
+        return requested;
+    }
+    if host == 10 && matches!(requested, 9 | 42 | 67) {
+        // A stand-in target's light views: packed SRV, R32_UINT UAV, and
+        // typeless 16-bit views all name the float format.
+        10
+    } else if host == 9 && requested == 9 {
+        // A typeless 16-bit-per-channel host texture needs a typed view.
+        10
+    } else {
+        requested
+    }
+}
+
+/// The typed format for a view without a description of a typeless texture.
+/// With the float substitution a typeless 16-bit-per-channel resource is
+/// sampled as RGBA16F; otherwise the title's own format stands (the host
+/// refuses typeless views). `None` leaves the view alone.
+pub(crate) fn default_shader_format(format: u32) -> Option<u32> {
+    if light_float_format() && pc_format(format) == 9 {
+        Some(10)
+    } else {
+        None
+    }
+}
+
 /// The typeless format of a format's family (itself if it has none).
 pub(crate) fn family(format: u32) -> u32 {
     const FAMILIES: [(u32, u32); 22] = [
@@ -281,6 +404,11 @@ pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
 /// the host copy is typed.
 pub(crate) fn view_format(this: This) -> Option<u32> {
     let own = pc_format(resource(this).desc.format);
+    // A stand-in target is typed: views name the host's float format, not
+    // the title's packed one (the host refuses a view of another family).
+    if stands_in(this) {
+        return None;
+    }
     let host = host_resource(this)?;
     // SAFETY: a live resource.
     let format = unsafe { host.GetDesc() }.Format.0 as u32;
@@ -309,6 +437,208 @@ fn mip_count(desc: &ResourceDesc) -> u32 {
                 .leading_zeros()
         }
         n => u32::from(n),
+    }
+}
+
+/// How `VICTORY_TEXTURE_MAX` was configured.
+#[derive(Clone, Copy)]
+enum TextureCapMode {
+    Fixed(u32),
+    Auto,
+}
+
+/// `VICTORY_TEXTURE_MAX=<pixels>` caps a sampled host texture's largest
+/// dimension by leaving out the top mips. `auto` starts at 1024 pixels and
+/// drops to 512 / 256 as the card fills (92% / 97% of its DXGI budget), the
+/// tiers used by the small-VRAM forks. Unset, `0` or an invalid value means
+/// no cap: the title's own dimensions are kept byte for byte.
+pub(crate) fn texture_cap() -> Option<u32> {
+    static MODE: std::sync::OnceLock<Option<TextureCapMode>> = std::sync::OnceLock::new();
+    let mode = (*MODE.get_or_init(|| {
+        let Ok(raw) = std::env::var("VICTORY_TEXTURE_MAX") else {
+            return None;
+        };
+        let raw = raw.trim();
+        if raw.is_empty() || raw == "0" {
+            return None;
+        }
+        if raw.eq_ignore_ascii_case("auto") {
+            return Some(TextureCapMode::Auto);
+        }
+        raw.parse::<u32>()
+            .ok()
+            .filter(|&n| n >= 64)
+            .map(TextureCapMode::Fixed)
+    }))?;
+    Some(match mode {
+        TextureCapMode::Fixed(n) => n,
+        TextureCapMode::Auto => {
+            let [budget, used, ..] = crate::host::host()
+                .and_then(|h| h.video_memory())
+                .unwrap_or([0; 4]);
+            let share = if budget > 0 {
+                used as f64 / budget as f64
+            } else {
+                0.0
+            };
+            if share >= 0.97 {
+                256
+            } else if share >= 0.92 {
+                512
+            } else {
+                1024
+            }
+        }
+    })
+}
+
+/// `VICTORY_TEXTURE_MB=<n>` limits one sampled texture's host allocation to
+/// `n` MiB, clamped to a quarter of the card's DXGI budget (the small-VRAM
+/// presets' rule). Unset: no byte budget. This is a second, independent
+/// reason to leave out top mips, alongside `VICTORY_TEXTURE_MAX`.
+fn texture_budget_bytes() -> Option<u64> {
+    static BUDGET: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let mb = (*BUDGET.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_MB")
+            .ok()?
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .filter(|&n| n > 0)
+    }))?;
+    let budget = mb.saturating_mul(1 << 20);
+    let quarter = crate::host::host()
+        .and_then(|h| h.video_memory())
+        .map_or(u64::MAX, |[local_budget, ..]| local_budget / 4);
+    Some(budget.min(quarter).max(1 << 20))
+}
+
+/// The number of top mip levels a capped host texture leaves out.
+///
+/// Only power-of-two 2D textures the title merely samples qualify. Render
+/// targets, depth and unordered-access textures are drawn at the title's own
+/// sizes, and a non-power-of-two texture (a 1920x1080 UI plane) must keep its
+/// exact dimensions. Never drops below a 256-pixel side.
+pub(crate) fn texture_mip_drop(desc: &ResourceDesc) -> u32 {
+    let cap = texture_cap();
+    let budget = texture_budget_bytes();
+    if cap.is_none() && budget.is_none() {
+        return 0;
+    }
+    if desc.dimension != TEXTURE_2D || desc.flags & USES != 0 || desc.sample_count > 1 {
+        return 0;
+    }
+    let (w, h) = (desc.width, u64::from(desc.height));
+    if h == 0 || !w.is_power_of_two() || !h.is_power_of_two() {
+        return 0;
+    }
+    // Console layout size is a close enough estimate of the host allocation
+    // for a budget decision; every mip dropped quarters the bytes.
+    let bytes = texture_layout(desc).map_or(0, |t| t.size);
+    mip_drop_for(w, h, mip_count(desc), bytes, cap, budget)
+}
+
+/// Pure form of the cap decision, so it can be tested without a host or env.
+fn mip_drop_for(
+    w: u64,
+    h: u64,
+    mips: u32,
+    bytes: u64,
+    cap: Option<u32>,
+    budget: Option<u64>,
+) -> u32 {
+    const FLOOR: u64 = 256;
+    let mut drop = 0;
+    loop {
+        if drop + 1 >= mips {
+            break;
+        }
+        if (w >> drop).max(h >> drop) <= cap.unwrap_or(u32::MAX) as u64
+            && budget.is_none_or(|b| (bytes >> (2 * drop)) <= b)
+        {
+            break;
+        }
+        if (w >> (drop + 1)) < FLOOR || (h >> (drop + 1)) < FLOOR {
+            break;
+        }
+        drop += 1;
+    }
+    drop
+}
+
+/// The host subresource for a title subresource of a mip-capped texture.
+/// `None` means the title names a level the host left out, so the copy or
+/// resolve must be dropped rather than redirected to the wrong mip.
+pub(crate) fn host_subresource(drop: u32, sub: u32) -> Option<u32> {
+    sub.checked_sub(drop)
+}
+
+/// Shift an SRV's mip window from the title's chain onto a host texture with
+/// `drop` top levels left out. Mip-capped textures are sampled-only, so
+/// buffer views (and all target/UAV views) never need this.
+#[cfg(windows)]
+pub(crate) fn rebase_srv_mips(
+    desc: &mut windows::Win32::Graphics::Direct3D12::D3D12_SHADER_RESOURCE_VIEW_DESC,
+    drop: u32,
+    host_mips: u32,
+) {
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_SRV_DIMENSION_TEXTURE1D, D3D12_SRV_DIMENSION_TEXTURE1DARRAY,
+        D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
+        D3D12_SRV_DIMENSION_TEXTURE3D, D3D12_SRV_DIMENSION_TEXTURECUBE,
+        D3D12_SRV_DIMENSION_TEXTURECUBEARRAY,
+    };
+    if drop == 0 {
+        return;
+    }
+    let last = host_mips.saturating_sub(1);
+    let rebase = |most: &mut u32, levels: &mut u32, min_lod: &mut f32| {
+        let end = if *levels == u32::MAX {
+            u32::MAX
+        } else {
+            most.saturating_add(*levels)
+        };
+        *most = most.saturating_sub(drop).min(last);
+        *levels = if end == u32::MAX {
+            u32::MAX
+        } else {
+            end.saturating_sub(drop).saturating_sub(*most).max(1)
+        };
+        *min_lod = (*min_lod - drop as f32).max(0.0);
+    };
+    // SAFETY: the union holds the struct named by `ViewDimension`.
+    unsafe {
+        match desc.ViewDimension {
+            D3D12_SRV_DIMENSION_TEXTURE1D => {
+                let v = &mut desc.Anonymous.Texture1D;
+                rebase(&mut v.MostDetailedMip, &mut v.MipLevels, &mut v.ResourceMinLODClamp);
+            }
+            D3D12_SRV_DIMENSION_TEXTURE1DARRAY => {
+                let v = &mut desc.Anonymous.Texture1DArray;
+                rebase(&mut v.MostDetailedMip, &mut v.MipLevels, &mut v.ResourceMinLODClamp);
+            }
+            D3D12_SRV_DIMENSION_TEXTURE2D => {
+                let v = &mut desc.Anonymous.Texture2D;
+                rebase(&mut v.MostDetailedMip, &mut v.MipLevels, &mut v.ResourceMinLODClamp);
+            }
+            D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+                let v = &mut desc.Anonymous.Texture2DArray;
+                rebase(&mut v.MostDetailedMip, &mut v.MipLevels, &mut v.ResourceMinLODClamp);
+            }
+            D3D12_SRV_DIMENSION_TEXTURE3D => {
+                let v = &mut desc.Anonymous.Texture3D;
+                rebase(&mut v.MostDetailedMip, &mut v.MipLevels, &mut v.ResourceMinLODClamp);
+            }
+            D3D12_SRV_DIMENSION_TEXTURECUBE => {
+                let v = &mut desc.Anonymous.TextureCube;
+                rebase(&mut v.MostDetailedMip, &mut v.MipLevels, &mut v.ResourceMinLODClamp);
+            }
+            D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => {
+                let v = &mut desc.Anonymous.TextureCubeArray;
+                rebase(&mut v.MostDetailedMip, &mut v.MipLevels, &mut v.ResourceMinLODClamp);
+            }
+            _ => {}
+        }
     }
 }
 
@@ -782,6 +1112,9 @@ pub(crate) struct HostTexture {
     /// A depth texture's writable twin (`crate::twin`), made with its first
     /// unordered access view; `None` inside if it has none.
     pub(crate) twin: std::sync::OnceLock<Option<crate::twin::Twin>>,
+    /// Top mip levels left out under `VICTORY_TEXTURE_MAX`: host mip `i`
+    /// holds the title's mip `i + mip_drop` (0 with no cap).
+    pub(crate) mip_drop: u32,
     /// Bytes it takes on the host GPU.
     bytes: u64,
     /// Its contents come from title memory (not host-written).
@@ -798,6 +1131,7 @@ impl HostTexture {
         state: u32,
         castable: Vec<u32>,
         filled: bool,
+        mip_drop: u32,
     ) -> Self {
         let bytes = crate::host::host().map_or(0, |h| {
             // SAFETY: plain queries on a live resource.
@@ -815,6 +1149,7 @@ impl HostTexture {
             host_written: false.into(),
             staging: std::sync::Mutex::new(None),
             twin: std::sync::OnceLock::new(),
+            mip_drop,
             bytes,
             filled,
             used: false.into(),
@@ -1033,6 +1368,13 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
         d.flags &= !UNORDERED;
     }
     d.format = pc_format(d.format);
+    // Opt-in packed-light substitution: a target/UAV the title describes
+    // as R9G9B9E5 is hosted as RGBA16F where the host refuses the packed
+    // format. Its views are remapped to the same format in
+    // `descriptor::host` so the pipeline stays consistent.
+    if d.flags & USES & (RENDER_TARGET_FLAG | UNORDERED) != 0 {
+        d.format = target_format(d.format);
+    }
     const DENY_SHADER_RESOURCE: u32 = 8;
     if d.flags & DENY_SHADER_RESOURCE == 0
         && let Some(&(_, typeless)) = DEPTH_FORMATS.iter().find(|&&(f, _)| f == d.format)
@@ -1044,10 +1386,22 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
     if d.flags & UNORDERED != 0 && SRGB.iter().any(|&(srgb, _)| srgb == d.format) {
         d.format = family(d.format);
     }
+    // Opt-in `VICTORY_TEXTURE_MAX`: a sampled-only power-of-two texture
+    // gives up its largest mips, so the host allocates only the levels the
+    // cap allows. Render targets, depth and UAVs keep the title's sizes.
+    let drop = texture_mip_drop(desc);
+    if drop > 0 {
+        d.width >>= drop;
+        d.height >>= drop;
+        d.mip_levels = (mip_count(desc) - drop) as u16;
+    }
     Some(d)
 }
 
 const DEPTH: u32 = 2;
+/// Render target: the console's flag 1, also the host's render-target use.
+#[cfg(windows)]
+const RENDER_TARGET_FLAG: u32 = 1;
 #[cfg(windows)]
 const UNORDERED: u32 = 4;
 /// Render target, depth, unordered access: what a host texture allows.
@@ -1145,7 +1499,7 @@ fn shared_texture(
     // shortcut: title textures of a replaced host texture keep it (placed
     // views move to the new one, `texture_at`); copies (`alias_source`)
     // bridge the two where the shapes allow.
-    let t = std::sync::Arc::new(make_texture(&d, state, clear)?);
+    let t = std::sync::Arc::new(make_texture(&d, state, clear, texture_mip_drop(desc))?);
     if let Some(k) = key {
         if live.is_some() {
             REPLACED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1190,7 +1544,12 @@ fn current(this: This) -> bool {
 /// [`castable`]'s formats (colour textures, through the enhanced-barrier
 /// creation; it starts in the common state) where the host takes that.
 #[cfg(windows)]
-fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<HostTexture> {
+fn make_texture(
+    d: &ResourceDesc,
+    state: u32,
+    clear: *const c_void,
+    mip_drop: u32,
+) -> Option<HostTexture> {
     use windows::Win32::Graphics::Direct3D12::*;
     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
     use windows::core::Interface;
@@ -1204,6 +1563,11 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
         // SAFETY: the title passes a whole clear value.
         let mut value = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
         value[0] = pc_format(value[0]);
+        // A stand-in target's clear value names the stand-in too: the
+        // colour words are floats in both formats, so only the tag changes.
+        if d.flags & (RENDER_TARGET_FLAG | UNORDERED) != 0 {
+            value[0] = target_format(value[0]);
+        }
         value
     });
     let clear_value = clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast::<D3D12_CLEAR_VALUE>());
@@ -1287,7 +1651,13 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
         format!("texture {}x{} f{} flags {:#x} @{:#x}", d.width, d.height, d.format, d.flags, texture.as_raw() as usize)
     });
     let initial = crate::host::legal_state(&texture, initial);
-    Some(HostTexture::new(texture, initial, castable_formats, fills(d)))
+    Some(HostTexture::new(
+        texture,
+        initial,
+        castable_formats,
+        fills(d),
+        mip_drop,
+    ))
 }
 
 /// A texture's console memory and description; `None` for buffers.
@@ -1422,6 +1792,17 @@ static TEXTURES_AT: std::sync::Mutex<std::collections::BTreeMap<u64, Vec<usize>>
 /// (elements of the same size, block-compressed ones counted in blocks),
 /// that has another host texture: what the GPU wrote there lives in that
 /// one, to be copied over (`texture::alias_copy`).
+///
+/// This is the light/R9G9B9E5 case from the console: the title packs light
+/// as shared-exponent words into R32_UINT textures with compute shaders
+/// (which cannot write R9G9B9E5) and samples them through placed
+/// R9G9B9E5 views. When both formats share one host texture (the common
+/// case: R9G9B9E5 is castable over R32_UINT) no copy is needed and the
+/// texels are read directly; when they do not (another mip or slice, or a
+/// cast the host refused), this finds the written texture and the read
+/// copies its bytes. With `VICTORY_LIGHT_FORMAT_FLOAT=1` a substituted
+/// target is excluded: its host texels are RGBA16F, not the title's packed
+/// words, so a raw copy would read garbage.
 /// shortcut: same start only; overlapping ranges, other mips or slices of
 /// one memory, and views of buffers are not matched.
 #[cfg(windows)]
@@ -1442,7 +1823,12 @@ pub(crate) fn alias_source(placed: This) -> Option<This> {
         .filter(|&r| r != placed)
         .find(|&r| {
             let a = resource(r);
+            // A substituted target lives on the host in RGBA16F, not in the
+            // title's R9G9B9E5 texels: copying its bits into the placed view
+            // would read garbage. The ordinary R32_UINT light texture is not
+            // substituted, so the castable pair (or this copy) still works.
             a.desc.flags & WRITTEN != 0
+                && target_format(a.desc.format) == a.desc.format
                 && bytes(&a.desc) == Some(want)
                 && matches!((&a.host, &b.host), (Some(x), Some(y)) if !std::sync::Arc::ptr_eq(x, y))
         })
@@ -1912,6 +2298,48 @@ pub(crate) fn test_buffer(width: u64) -> This {
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[test]
+    fn packed_light_substitution_is_opt_in() {
+        // The switch is read from the environment once, and the test suite
+        // does not set it: the title's formats must be kept by default.
+        assert!(!light_float_format());
+        assert_eq!(target_format(67), 67);
+        assert_eq!(target_format(42), 42);
+        assert_eq!(stand_in_view_format(42, 67), 67);
+        assert_eq!(stand_in_view_format(10, 9), 9);
+        assert_eq!(default_shader_format(9), None);
+    }
+
+    #[test]
+    fn texture_cap_drops_only_the_levels_above_the_cap() {
+        // 2048x2048, 12 mips; a 1024 cap drops one level and quarters the
+        // allocation, but never below a 256-pixel side.
+        assert_eq!(mip_drop_for(2048, 2048, 12, 1 << 26, Some(1024), None), 1);
+        assert_eq!(mip_drop_for(2048, 2048, 12, 1 << 26, Some(512), None), 2);
+        assert_eq!(mip_drop_for(2048, 2048, 12, 1 << 26, Some(256), None), 3);
+        // A cap bigger than the texture changes nothing.
+        assert_eq!(mip_drop_for(1024, 1024, 11, 1 << 24, Some(2048), None), 0);
+        // No cap at all: no drop.
+        assert_eq!(mip_drop_for(4096, 4096, 13, 1 << 28, None, None), 0);
+    }
+
+    #[test]
+    fn texture_byte_budget_also_drops_levels() {
+        // 64 MiB budget on a 2048 texture (~64 MiB at mip 0 with mips) needs
+        // one level dropped; the pixel cap and the byte budget combine.
+        let budget = 64 << 20;
+        assert_eq!(mip_drop_for(2048, 2048, 12, 1 << 27, None, Some(budget)), 1);
+        assert_eq!(mip_drop_for(4096, 4096, 13, 1 << 28, Some(1024), Some(budget)), 2);
+    }
+
+    #[test]
+    fn host_subresource_of_a_dropped_mip_is_none() {
+        assert_eq!(host_subresource(0, 3), Some(3));
+        assert_eq!(host_subresource(2, 3), Some(1));
+        assert_eq!(host_subresource(2, 1), None);
+        assert_eq!(host_subresource(2, 0), None);
+    }
 
     #[test]
     fn a8_unorm_is_not_in_the_r8_typeless_family() {

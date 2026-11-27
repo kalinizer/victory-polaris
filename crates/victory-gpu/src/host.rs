@@ -2685,6 +2685,7 @@ struct Compositor {
     root: ID3D12RootSignature,
     opaque: ID3D12PipelineState,
     overlay: ID3D12PipelineState,
+    combine: ID3D12PipelineState,
     rtv_heap: ID3D12DescriptorHeap,
     srv_heap: ID3D12DescriptorHeap,
     srv_stride: u32,
@@ -2692,6 +2693,10 @@ struct Compositor {
 
 impl Compositor {
     fn new(device: &ID3D12Device, format: DXGI_FORMAT) -> windows::core::Result<Self> {
+        // `SampleLevel(..., 0)` is deliberate: the console presents planes at
+        // different resolutions, and implicit LOD selection on a scaled
+        // fullscreen triangle picks a mip that turns the UI into a blur. With
+        // a one-mip SRV this also matches the fork's known-good path exactly.
         const SOURCE: &str = r#"
             Texture2D tex : register(t0);
             SamplerState smp : register(s0);
@@ -2700,17 +2705,35 @@ impl Compositor {
                 pos = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
             }
             float4 ps(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
-                return tex.Sample(smp, uv);
+                return tex.SampleLevel(smp, uv, 0);
             }
         "#;
-        let compile = |entry: PCSTR, target: PCSTR| -> windows::core::Result<ID3DBlob> {
+        // Opt-in (`VICTORY_PRESENT_SHADER_COMBINE`): the fork's single-draw
+        // combine of the scene (t0) and interface (t1), with saturated
+        // premultiplied alpha and an opaque output. Avoids two draws and any
+        // reliance on the render-target blend for the overlay.
+        const COMBINE_SOURCE: &str = r#"
+            Texture2D scene : register(t0);
+            Texture2D over : register(t1);
+            SamplerState smp : register(s0);
+            void vs(uint id : SV_VertexID, out float4 pos : SV_Position, out float2 uv : TEXCOORD) {
+                uv = float2((id << 1) & 2, id & 2);
+                pos = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+            }
+            float4 ps(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
+                float4 s = scene.SampleLevel(smp, uv, 0);
+                float4 o = over.SampleLevel(smp, uv, 0);
+                return float4(saturate(o.rgb + s.rgb * (1 - saturate(o.a))), 1);
+            }
+        "#;
+        let compile = |source: &str, entry: PCSTR, target: PCSTR| -> windows::core::Result<ID3DBlob> {
             let mut code: Option<ID3DBlob> = None;
             let mut errors: Option<ID3DBlob> = None;
             // SAFETY: static source and entry/target strings; out pointers ours.
             let res = unsafe {
                 D3DCompile(
-                    SOURCE.as_ptr().cast(),
-                    SOURCE.len(),
+                    source.as_ptr().cast(),
+                    source.len(),
                     s!("present_composite"),
                     None,
                     None,
@@ -2737,18 +2760,25 @@ impl Compositor {
             }
             code.ok_or_else(windows::core::Error::empty)
         };
-        let vs = compile(s!("vs"), s!("vs_5_1"))?;
-        let ps = compile(s!("ps"), s!("ps_5_1"))?;
+        let vs = compile(SOURCE, s!("vs"), s!("vs_5_1"))?;
+        let ps = compile(SOURCE, s!("ps"), s!("ps_5_1"))?;
+        let ps_combine = compile(COMBINE_SOURCE, s!("ps"), s!("ps_5_1"))?;
         // SAFETY: compiled shader blobs live through PSO creation.
         unsafe {
             let vs_bytes =
                 std::slice::from_raw_parts(vs.GetBufferPointer().cast::<u8>(), vs.GetBufferSize());
             let ps_bytes =
                 std::slice::from_raw_parts(ps.GetBufferPointer().cast::<u8>(), ps.GetBufferSize());
+            let ps_combine_bytes = std::slice::from_raw_parts(
+                ps_combine.GetBufferPointer().cast::<u8>(),
+                ps_combine.GetBufferSize(),
+            );
             // Wine's D3DCompile does not embed a root signature in the shader blobs.
             let range = D3D12_DESCRIPTOR_RANGE {
                 RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
-                NumDescriptors: 1,
+                // Two: the opt-in combine pixel shader reads t0 and t1 from
+                // one table. The per-plane shaders simply ignore t1.
+                NumDescriptors: 2,
                 OffsetInDescriptorsFromTableStart: D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND,
                 ..Default::default()
             };
@@ -2763,14 +2793,17 @@ impl Compositor {
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
             };
             let sampler = D3D12_STATIC_SAMPLER_DESC {
-                Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+                // Plain bilinear: no anisotropic footprint and no mip
+                // filtering (the shaders sample mip 0 explicitly).
+                Filter: D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT,
                 AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
                 AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
                 AddressW: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
-                MaxAnisotropy: 16,
+                MaxAnisotropy: 1,
                 ComparisonFunc: D3D12_COMPARISON_FUNC_LESS_EQUAL,
                 BorderColor: D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE,
-                MaxLOD: f32::MAX,
+                MinLOD: 0.0,
+                MaxLOD: 0.0,
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
                 ..Default::default()
             };
@@ -2789,7 +2822,7 @@ impl Compositor {
                 signature.GetBufferSize(),
             );
             let root: ID3D12RootSignature = device.CreateRootSignature(0, signature)?;
-            let make_pso = |blend: bool| -> windows::core::Result<ID3D12PipelineState> {
+            let make_pso = |ps: &[u8], blend: bool| -> windows::core::Result<ID3D12PipelineState> {
                 let mut rt_blend = D3D12_RENDER_TARGET_BLEND_DESC {
                     RenderTargetWriteMask: D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8,
                     ..Default::default()
@@ -2814,8 +2847,8 @@ impl Compositor {
                         BytecodeLength: vs_bytes.len(),
                     },
                     PS: D3D12_SHADER_BYTECODE {
-                        pShaderBytecode: ps_bytes.as_ptr().cast(),
-                        BytecodeLength: ps_bytes.len(),
+                        pShaderBytecode: ps.as_ptr().cast(),
+                        BytecodeLength: ps.len(),
                     },
                     BlendState: blend_desc,
                     SampleMask: u32::MAX,
@@ -2838,8 +2871,9 @@ impl Compositor {
                 let _ = std::mem::ManuallyDrop::into_inner(desc.pRootSignature);
                 pso
             };
-            let opaque = make_pso(false)?;
-            let overlay = make_pso(true)?;
+            let opaque = make_pso(ps_bytes, false)?;
+            let overlay = make_pso(ps_bytes, true)?;
+            let combine = make_pso(ps_combine_bytes, false)?;
             let rtv_heap: ID3D12DescriptorHeap =
                 device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                     Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
@@ -2861,6 +2895,7 @@ impl Compositor {
                 root,
                 opaque,
                 overlay,
+                combine,
                 rtv_heap,
                 srv_heap,
                 srv_stride,
@@ -3048,6 +3083,60 @@ impl Meter {
     }
 }
 
+/// `VICTORY_LOG_PLANES`: last composite configuration reported, so a run
+/// without captures can verify the swap-chain size/format and each plane's
+/// SRV format without a log line per frame.
+static COMPOSITE_LOG: Mutex<Option<(u32, u32, i32, bool, Vec<(u32, u32, i32, i32)>)>> =
+    Mutex::new(None);
+
+fn log_composite(
+    frame: u64,
+    width: u32,
+    height: u32,
+    format: DXGI_FORMAT,
+    base_size: bool,
+    planes: &[(u32, u32, i32, i32)],
+) {
+    if !crate::switch::on("VICTORY_LOG_PLANES") {
+        return;
+    }
+    let signature = (width, height, format.0, base_size, planes.to_vec());
+    let mut last = COMPOSITE_LOG.lock().unwrap_or_else(|e| e.into_inner());
+    if last.as_ref() == Some(&signature) {
+        return;
+    }
+    *last = Some(signature);
+    drop(last);
+    tracing::info!(
+        frame, width, height, format = format.0, base_size, planes = planes.len(),
+        "present composite target"
+    );
+    for (i, &(w, h, resource, srv)) in planes.iter().enumerate() {
+        tracing::info!(
+            frame, plane = i, width = w, height = h,
+            resource_format = resource, srv_format = srv,
+            "present plane srv"
+        );
+    }
+}
+
+/// `VICTORY_RENDER_SCALE=<factor>` shrinks the swap chain (the displayed
+/// image) without touching the title's render targets. `1` keeps the title's
+/// size; `0.5` and `0.75` are the useful values on a 1080p screen. Only
+/// factors in `0 < f <= 1` are accepted; anything else keeps 1.
+fn present_scale() -> f32 {
+    static SCALE: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *SCALE.get_or_init(|| {
+        let Ok(raw) = std::env::var("VICTORY_RENDER_SCALE") else {
+            return 1.0;
+        };
+        match raw.trim().parse::<f32>() {
+            Ok(f) if f.is_finite() && f > 0.0 && f <= 1.0 => f,
+            _ => 1.0,
+        }
+    })
+}
+
 impl Host {
     /// Shows one or more `planes` (each a live host texture and its current
     /// host state, kept in that state), compositing planes 1.. on top of
@@ -3092,6 +3181,7 @@ impl Host {
             tracing::warn!(format = primary_desc.Format.0, "cannot present this format");
             return None;
         };
+        let scale = present_scale();
         let mut presentation = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
         let Presentation { presenter, retry } = &mut *presentation;
         if presenter.is_none() && !retry.ready(Instant::now()) {
@@ -3102,7 +3192,9 @@ impl Host {
             .and_then(|p| p.compositor.as_ref())
             .map(|c| c.format);
         let mut new_compositor = None;
-        let planes = if planes.len() > 1 && cached_format != Some(format) {
+        // A scaled single plane needs the sampling pass too: CopyResource
+        // demands matching dimensions and cannot downscale.
+        let planes = if (planes.len() > 1 || scale < 1.0) && cached_format != Some(format) {
             match create_compositor(&self.device, format) {
                 Ok(c) => {
                     new_compositor = Some(c);
@@ -3119,10 +3211,13 @@ impl Host {
         let (mut width, mut height) = (primary_desc.Width as u32, primary_desc.Height);
         // The console composes every plane to the base plane's size. Using
         // the largest plane here scales the 1080p scene up to 4K and then
-        // lets the window scale it down again, which blurs the 4K UI. The
-        // fork's known-good path uses the base size and lets the compositor
-        // sample the UI plane down once (`VICTORY_PRESENT_BASE_SIZE=1`).
-        let base_size = crate::switch::on("VICTORY_PRESENT_BASE_SIZE");
+        // lets the window scale it down again, which blurs the 4K UI. Use the
+        // base size by default (this tree targets a 1080p display); setting
+        // `VICTORY_PRESENT_BASE_SIZE=0` restores the old largest-plane size.
+        // No mismatch with the swap chain below: whenever this changes the
+        // requested size, the resize at the end of presenter setup updates
+        // the chain before any plane is drawn.
+        let base_size = crate::switch::on_by_default("VICTORY_PRESENT_BASE_SIZE");
         if !base_size {
             for &(tex, _) in &planes[1..] {
                 // SAFETY: live resource.
@@ -3130,6 +3225,13 @@ impl Host {
                 width = width.max(d.Width as u32);
                 height = height.max(d.Height);
             }
+        }
+        // Opt-in `VICTORY_RENDER_SCALE`: only the swap chain changes. The
+        // title still renders into its own targets; the compositor (or the
+        // window's own stretch) samples them down to this size.
+        if scale < 1.0 {
+            width = ((f64::from(width) * f64::from(scale)).round() as u32).max(1);
+            height = ((f64::from(height) * f64::from(scale)).round() as u32).max(1);
         }
         if presenter.is_none() {
             *presenter = match retry
@@ -3175,7 +3277,7 @@ impl Host {
             };
             p.copy.reset();
             let list = &p.copy.list;
-            let (capture, probe) = if planes.len() == 1 {
+            let (capture, probe) = if planes.len() == 1 && scale == 1.0 {
                 let (texture, state) = planes[0];
                 let state = D3D12_RESOURCE_STATES(state as i32);
                 let mut before = Vec::with_capacity(2);
@@ -3270,9 +3372,11 @@ impl Host {
                 let count = planes.len().min(MAX_PLANES as usize);
                 let mut before = Vec::with_capacity(count + 1);
                 let mut after = Vec::with_capacity(count);
+                let mut plane_info = Vec::with_capacity(count);
                 for (i, &(tex, state)) in planes[..count].iter().enumerate() {
                     let d = tex.GetDesc();
                     let srv_fmt = swap_format(d.Format).unwrap_or(d.Format);
+                    plane_info.push((d.Width as u32, d.Height, d.Format.0, srv_fmt.0));
                     let handle = D3D12_CPU_DESCRIPTOR_HANDLE {
                         ptr: srv_cpu_base.ptr + i * comp.srv_stride as usize,
                     };
@@ -3311,6 +3415,9 @@ impl Host {
                         ));
                     }
                 }
+                // Report the chain's actual size (after any resize) and the
+                // views we just made, once per configuration.
+                log_composite(frame, p.width, p.height, p.format, base_size, &plane_info);
                 before.push(transition(
                     &back,
                     D3D12_RESOURCE_STATE_PRESENT,
@@ -3335,15 +3442,25 @@ impl Host {
                 }]);
                 list.OMSetRenderTargets(1, Some(&rtv), false, None);
                 list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-                for i in 0..count {
-                    list.SetPipelineState(if i == 0 { &comp.opaque } else { &comp.overlay });
-                    list.SetGraphicsRootDescriptorTable(
-                        0,
-                        D3D12_GPU_DESCRIPTOR_HANDLE {
-                            ptr: srv_gpu_base.ptr + (i as u64) * u64::from(comp.srv_stride),
-                        },
-                    );
+                // Opt-in fork-style combine for the two-plane case: one draw,
+                // both textures in one table, saturation and opaque output in
+                // the shader rather than relying on the target blend. More
+                // than two planes keep the original per-plane overlay path.
+                if crate::switch::on("VICTORY_PRESENT_SHADER_COMBINE") && count == 2 {
+                    list.SetPipelineState(&comp.combine);
+                    list.SetGraphicsRootDescriptorTable(0, srv_gpu_base);
                     list.DrawInstanced(3, 1, 0, 0);
+                } else {
+                    for i in 0..count {
+                        list.SetPipelineState(if i == 0 { &comp.opaque } else { &comp.overlay });
+                        list.SetGraphicsRootDescriptorTable(
+                            0,
+                            D3D12_GPU_DESCRIPTOR_HANDLE {
+                                ptr: srv_gpu_base.ptr + (i as u64) * u64::from(comp.srv_stride),
+                            },
+                        );
+                        list.DrawInstanced(3, 1, 0, 0);
+                    }
                 }
                 #[cfg(feature = "diagnostics")]
                 let (capture, probe) = {
@@ -4159,7 +4276,17 @@ mod present_plane_tests {
             .is_some(),
             "compositor initialization can be retried after failure"
         );
-        // Premultiplied half-blue over opaque red.
-        assert_eq!(composite, Some((64, 64, [127, 0, 128, 255])));
+        // Premultiplied half-blue over opaque red. Base-size composing (the
+        // default) keeps the swap chain at the scene plane's 32x32; `=0`
+        // would use the larger overlay's 64x64.
+        let size = if crate::switch::on_by_default("VICTORY_PRESENT_BASE_SIZE") {
+            (32, 32)
+        } else {
+            (64, 64)
+        };
+        assert_eq!(
+            composite,
+            Some((size.0, size.1, [127, 0, 128, 255]))
+        );
     }
 }
