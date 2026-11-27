@@ -1014,15 +1014,21 @@ fn emulated_mesh_pipeline(
     ) {
         Ok(pso) => pso,
         Err(e) => {
-            tracing::warn!(
-                error = %e,
-                ?shaders,
-                depth_enable = ?g.depth.DepthEnable,
-                depth_format = ?g.depth_format,
-                num_rts = g.targets.NumRenderTargets,
-                topology = ?g.topology,
-                inputs = g.inputs.len(),
-                "emulated mesh graphics pipeline refused"
+            eprintln!(
+                "EMULATED MESH REFUSED: error={} shaders={:?} depth_enable={:?} depth_format={:?} num_rts={} rt_formats={:?} topology={:?} inputs={} blend_src={:?} blend_dst={:?} blend_op={:?} cull={:?} fill={:?}",
+                e,
+                shaders,
+                g.depth.DepthEnable,
+                g.depth_format,
+                g.targets.NumRenderTargets,
+                g.targets.RTFormats,
+                g.topology,
+                g.inputs.len(),
+                g.blend.RenderTarget[0].SrcBlend,
+                g.blend.RenderTarget[0].DestBlend,
+                g.blend.RenderTarget[0].BlendOp,
+                g.rasterizer.CullMode,
+                g.rasterizer.FillMode
             );
             host.log_messages();
             return None;
