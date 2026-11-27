@@ -88,6 +88,10 @@ pub(crate) struct State {
     /// Graphics, compute.
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
+    /// Whether a host list has had its heaps set at least once. With the
+    /// fallback on, an all-zero title heap set still needs our one-slot
+    /// heaps bound once.
+    host_heaps_set: bool,
     /// Tables made afresh in this list: (table, what it holds) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u64), u32>,
@@ -276,7 +280,8 @@ impl State {
     /// dispatch.
     pub(crate) fn host_state_lost(&mut self) {
         // No title heaps (0) differ from what the host list has, too.
-        (self.host_pipeline, self.host_roots, self.host_heaps) = (0, [0; 2], [usize::MAX; 2]);
+        (self.host_pipeline, self.host_roots, self.host_heaps, self.host_heaps_set) =
+            (0, [0; 2], [usize::MAX; 2], false);
     }
 
     pub(crate) fn set_heaps(&mut self, heaps: &[This]) {
@@ -993,28 +998,59 @@ impl State {
         Some((index, offset))
     }
 
-    /// Gives the host list the title's heaps if it has others.
+    /// Gives the host list the title's heaps if it has others. With
+    /// `VICTORY_FALLBACK_HEAPS=1`, a missing heap of either kind gets a
+    /// one-slot host heap: a directly indexed root signature needs both a
+    /// view and a sampler heap bound, or UI draws sample null descriptors
+    /// and show a flat gradient.
     fn bind_heaps(&mut self, list: &HostList, memory_heap: bool) {
         let want = if memory_heap {
             [MEMORY_HEAP, self.heaps[1]]
         } else {
             self.heaps
         };
-        if self.host_heaps != want {
-            let mut heaps: Vec<Option<ID3D12DescriptorHeap>> = self
-                .heaps
-                .iter()
-                .filter(|&&h| h != 0)
-                .filter_map(|&h| crate::descriptor::heap(h as This).host())
-                .map(|h| Some(h.heap.clone()))
-                .collect();
+        let fallback = crate::host::fallback_heaps();
+        if (fallback && !self.host_heaps_set) || self.host_heaps != want {
+            let mut view_heap: Option<ID3D12DescriptorHeap> = None;
+            let mut sampler_heap: Option<ID3D12DescriptorHeap> = None;
+            for &h in &self.heaps {
+                if h == 0 {
+                    continue;
+                }
+                let title_heap = crate::descriptor::heap(h as This);
+                if let Some(host_heap) = title_heap.host() {
+                    if title_heap.samplers() {
+                        sampler_heap = Some(host_heap.heap.clone());
+                    } else {
+                        view_heap = Some(host_heap.heap.clone());
+                    }
+                }
+            }
+            if fallback && view_heap.is_none() {
+                view_heap = crate::host::host().and_then(|h| h.fallback_view_heap().cloned());
+            }
+            if fallback && sampler_heap.is_none() {
+                sampler_heap = crate::host::host().and_then(|h| h.fallback_sampler_heap().cloned());
+            }
+            let mut heaps: Vec<Option<ID3D12DescriptorHeap>> = Vec::with_capacity(2);
+            if let Some(h) = view_heap {
+                list.keep(&h);
+                heaps.push(Some(h));
+            }
+            if let Some(h) = sampler_heap {
+                list.keep(&h);
+                heaps.push(Some(h));
+            }
             if memory_heap && let Some(h) = crate::memory::heap() {
+                list.keep(&h.heap);
                 heaps.insert(0, Some(h.heap.clone()));
             }
-            heaps.iter().flatten().for_each(|h| list.keep(h));
-            // SAFETY: an open list and shader-visible heaps.
-            unsafe { list.list.SetDescriptorHeaps(&heaps) };
+            if !heaps.is_empty() {
+                // SAFETY: an open list and shader-visible heaps.
+                unsafe { list.list.SetDescriptorHeaps(&heaps) };
+            }
             self.host_heaps = want;
+            self.host_heaps_set = true;
             self.host_roots = [0; 2];
         }
     }

@@ -64,6 +64,10 @@ pub(crate) struct Host {
     presenter: Mutex<Presentation>,
     /// The adapter the device is on, for its memory budget (`video_memory`).
     adapter: Option<IDXGIAdapter3>,
+    /// One-slot shader-visible heaps bound where a list sets none, for
+    /// directly-indexed root signatures (`VICTORY_FALLBACK_HEAPS`).
+    fallback_view: OnceLock<Option<ID3D12DescriptorHeap>>,
+    fallback_sampler: OnceLock<Option<ID3D12DescriptorHeap>>,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -71,6 +75,81 @@ pub(crate) struct Host {
 unsafe impl Send for Host {}
 // SAFETY: as above.
 unsafe impl Sync for Host {}
+
+/// Bind a one-slot host heap of each kind where the title set none. A root
+/// signature with directly indexed heaps needs both a view and a sampler
+/// heap bound; a UI draw that sets no heaps otherwise samples null
+/// descriptors and shows a flat gradient (`VICTORY_FALLBACK_HEAPS=1`).
+pub(crate) fn fallback_heaps() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| matches!(std::env::var("VICTORY_FALLBACK_HEAPS").as_deref(), Ok("1")))
+}
+
+impl Host {
+    /// A one-slot shader-visible CBV/SRV/UAV heap with a null SRV, for a list
+    /// that set no view heap but uses directly indexed views.
+    pub(crate) fn fallback_view_heap(&self) -> Option<&ID3D12DescriptorHeap> {
+        self.fallback_view
+            .get_or_init(|| {
+                unsafe {
+                    let heap: ID3D12DescriptorHeap = self
+                        .device
+                        .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                            Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                            NumDescriptors: 1,
+                            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                            NodeMask: 0,
+                        })
+                        .ok()?;
+                    let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                        Format: DXGI_FORMAT_R32_UINT,
+                        ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                            Buffer: D3D12_BUFFER_SRV::default(),
+                        },
+                    };
+                    self.device.CreateShaderResourceView(
+                        None,
+                        Some(&desc),
+                        heap.GetCPUDescriptorHandleForHeapStart(),
+                    );
+                    Some(heap)
+                }
+            })
+            .as_ref()
+    }
+
+    /// A one-slot shader-visible sampler heap, for a list that set none.
+    pub(crate) fn fallback_sampler_heap(&self) -> Option<&ID3D12DescriptorHeap> {
+        self.fallback_sampler
+            .get_or_init(|| {
+                unsafe {
+                    let heap: ID3D12DescriptorHeap = self
+                        .device
+                        .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                            Type: D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
+                            NumDescriptors: 1,
+                            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                            NodeMask: 0,
+                        })
+                        .ok()?;
+                    let desc = D3D12_SAMPLER_DESC {
+                        Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
+                        AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                        AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                        AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                        MaxLOD: f32::MAX,
+                        ..Default::default()
+                    };
+                    self.device
+                        .CreateSampler(&desc, heap.GetCPUDescriptorHandleForHeapStart());
+                    Some(heap)
+                }
+            })
+            .as_ref()
+    }
+}
 
 /// Time spent in submissions since the last frame-rate line, in
 /// microseconds: preparing them on the CPU (title memory copies, texture
@@ -271,6 +350,8 @@ fn create() -> windows::core::Result<Host> {
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(Presentation::default()),
             adapter,
+            fallback_view: OnceLock::new(),
+            fallback_sampler: OnceLock::new(),
         })
     }
 }
