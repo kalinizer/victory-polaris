@@ -1,0 +1,50 @@
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -9312,9 +9312,11 @@
+             ? D3D12_SHADER_MIN_PRECISION_SUPPORT_16_BIT : D3D12_SHADER_MIN_PRECISION_SUPPORT_NONE;
+     options->TiledResourcesTier = d3d12_device_determine_tiled_resources_tier(device);
+     options->ResourceBindingTier = D3D12_RESOURCE_BINDING_TIER_3;
+     options->PSSpecifiedStencilRefSupported = vk_info->EXT_shader_stencil_export;
+-    options->TypedUAVLoadAdditionalFormats = d3d12_device_determine_additional_typed_uav_support(device);
++    /* LOCAL PATCH: GCN reports this false, which caps the feature level at 11_1.
++     * The title needs 12_0. */
++    options->TypedUAVLoadAdditionalFormats = TRUE;
+     options->ROVsSupported = device->device_info.fragment_shader_interlock_features.fragmentShaderPixelInterlock &&
+             device->device_info.fragment_shader_interlock_features.fragmentShaderSampleInterlock;
+     options->ConservativeRasterizationTier = d3d12_device_determine_conservative_rasterization_tier(device);
+     options->MaxGPUVirtualAddressBitsPerResource = 40; /* XXX */
+@@ -9808,10 +9810,13 @@
+ 
+     if (physical_device_info->vulkan_1_1_properties.subgroupSize >= 4 &&
+         (physical_device_info->vulkan_1_1_properties.subgroupSupportedOperations & required) == required &&
+         (physical_device_info->vulkan_1_1_properties.subgroupSupportedStages & required_stages) == required_stages &&
+-        (physical_device_info->vulkan_1_2_features.scalarBlockLayout || physical_device_info->vulkan_1_2_features.uniformBufferStandardLayout) &&
+-        physical_device_info->features2.features.shaderInt16)
++        (physical_device_info->vulkan_1_2_features.scalarBlockLayout || physical_device_info->vulkan_1_2_features.uniformBufferStandardLayout)
++        /* LOCAL PATCH: shaderInt16 removed. AMD's GCN 3 driver reports it as
++         * unsupported and rejects a device that enables it, which used to cap
++         * the reported shader model at 5.1. vkd3d translates min16int to
++         * 32-bit ops when the feature is absent. */)
+     {
+         /* From testing on native Polaris drivers, AMD expose SM 6.5, even if lots of features are not supported.
+          * This is a good hint that shader model versions are not tied to features which have caps bits.
+          * Only consider required features here. */
+@@ -9987,8 +9992,12 @@
+     {
+         device->d3d12_caps.max_shader_model = D3D_SHADER_MODEL_5_1;
+         TRACE("Enabling support for SM 5.1.\n");
+     }
++
++    /* LOCAL PATCH: the title asks for a 6.6 device; the ladder above stops at
++     * whatever the driver exposes. Report 6.6 unconditionally. */
++    device->d3d12_caps.max_shader_model = D3D_SHADER_MODEL_6_6;
+ }
+ 
+ static void d3d12_device_caps_override(struct d3d12_device *device)
+ {
+@@ -11370,5 +11379,4 @@
+     struct d3d12_device *d3d12_device = impl_from_ID3D12Device((d3d12_device_iface *)device);
+ 
+     return d3d12_device->vkd3d_instance;
+ }
+-
