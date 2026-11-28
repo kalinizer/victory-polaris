@@ -399,6 +399,15 @@ static VIEWS: std::sync::Mutex<Views> = std::sync::Mutex::new(Views {
 });
 const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
 
+/// Hard bound on recorded views. Placed views name title-memory addresses
+/// that change without a resource object ever being destroyed, so the table
+/// cannot rely on `forget` alone: without a cap it grows for the whole run
+/// and the process dies allocating a multi-gigabyte vector. A reset makes
+/// outstanding handles stale (they resolve to no view, the existing null
+/// path), which is preferable to losing the run.
+const MAX_VIEWS: usize = 1 << 18;
+static VIEW_RESETS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 impl View {
     /// The resource objects the view names.
     fn resources(&self) -> [usize; 2] {
@@ -424,6 +433,16 @@ fn record(handle: u64, view: View) {
                     i
                 }
                 None => {
+                    if views.list.len() >= MAX_VIEWS {
+                        views.list.clear();
+                        views.index.clear();
+                        views.by_resource.clear();
+                        views.free.clear();
+                        let resets = VIEW_RESETS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        if resets <= 4 || resets.is_power_of_two() {
+                            tracing::warn!(resets, cap = MAX_VIEWS, "recorded-view table reset");
+                        }
+                    }
                     views.list.push((view.clone(), 1));
                     views.list.len() as u32 - 1
                 }
