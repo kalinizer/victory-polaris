@@ -217,7 +217,11 @@ Notes learned the hard way:
 - Start the shell with a long timeout (e.g. `-Timeout 10800000`). A 2400 s
   timeout once killed a healthy run. The world takes ~20–25 min to load after
   the keys clear first boot.
-- Use potato `settings.xml` and a manual save.
+- Use potato `settings.xml` and a manual save. On a 1080p screen also set
+  `VICTORY_UI_RESOLUTION=1920x1080`: the title saved `3840x2160` on first boot
+  and lays its menu out for that size, so compositing the 4K UI plane down to
+  1080p blurs the text. The switch backs up the title's `settings.xml` once
+  (`=restore` undoes it); it does not touch the game package.
 - A background shell captures output with `Tee-Object -FilePath <log>` so the
   counts below can be measured after a crash.
 
@@ -361,12 +365,15 @@ Switches below are off when unset or `0`, unless the row says otherwise.
 | `VICTORY_SNAPSHOT_POOL_MIB=<n>` | snapshot buffers kept for reuse (default 512 MiB, was hardcoded 2 GiB; 0 disables reuse) — lowers resident memory on 16 GB machines |
 | `VICTORY_XMEM_WATCH_FILTER=1` | opt-in (default **off**) XMem write-watch filter: leaves CPU-only, `PAGE_GRAPHICS_NOACCESS`/`READONLY`, host read-only/no-access and `XMEM_MAPPABLE` reservations unwatched; GPU copy-backs of `PAGE_GRAPHICS_READONLY` memory are skipped. Unwatched ranges a host copy takes are copied whole on refresh, so A/B the frame log (`xmem watch filter: … ranges skipped …`) before keeping it on |
 | `VICTORY_IDLE_RECLAIM=0` | turn off the periodic release of idle title-memory shadow windows (on by default; reclaim starts past **half** of `VICTORY_CARD_BUFFERS_MB`, or at the window ceiling, and then drops every unused window) |
+| `VICTORY_BUFFER_COPY_RECLAIM=0` | turn off reclamation of **cold registered-buffer copies** (on by default). A registered buffer keeps its guest entry when its copy is given back: under shadow-budget pressure the oldest copies no view, list or pending write holds go first, and the idle sweep drops copies unused for `VICTORY_BUFFER_COPY_IDLE_MS`; the next look makes a fresh one. Ported from `itkomarov/dirtemu` `4c1c518e3f` to free bytes for root-view windows (log: `registered-buffer copies reclaimed`) |
+| `VICTORY_BUFFER_COPY_IDLE_MS=<n>` | age before an unreferenced registered-buffer copy goes in the idle sweep (default **10000**; pressure reclamation ignores it) |
 | `VICTORY_IDLE_FRAMES=<n>` | ticks without a use before a window goes when there is no pressure (default 2; was 4) |
 | `VICTORY_ROOT_VIEW_WINDOWS=<n>` | hard ceiling on live loose root-view windows, with oldest-used eviction (default 256) |
 | `VICTORY_ROOT_VIEW_REGISTERED_LOOSE=1\|0` | route root views of registered buffers refused by `VICTORY_CARD_BUFFERS_MB` into bounded loose windows instead of per-address sinks (on by default; `0` restores the baseline sink/null fallback, the single-buffer sink pool and un-deduped fills) |
 | `VICTORY_ROOT_VIEW_MB=<n>` | cap on the bytes refreshed per root view (default **1** MiB). `0` explicitly means unlimited (refresh to the copy's end): risky here — it made ~1000 root views/frame copy ~1.3 GB/frame and fail with `0x8007000E`. A positive value larger than 1 may be needed if a shader's data sits past the first MiB |
 | `VICTORY_ROOT_VIEW_SINK_MB=<n>` | size of the single sink arena (1 MiB slots) for root SRV/UAV views with no host copy (default **64** MiB = 64 slots; CBVs use 64 KiB upload scratch and never enter the pool). `0` disables sinks and always binds a null raw view. With `VICTORY_ROOT_VIEW_REGISTERED_LOOSE=0` each sink is a separate buffer instead. Without a cap ~5000 refusals/frame each kept a fresh 1 MiB buffer until list reset, exhausting commit at scene load (`0x8007000E`) |
 | `VICTORY_RENDER_SCALE=<factor>` | shrink the **swap chain** only (`0.5`, `0.75`; `1`/unset keeps the title's size). The title still renders into its own targets, so this saves swap-chain memory and sampling work, **not** the 7+ GB of host textures. A scaled single plane goes through the sampling compositor instead of `CopyResource` |
+| `VICTORY_UI_RESOLUTION=<WIDTHxHEIGHT>` | opt-in: before title code starts, set the screen size the title saved in its own `settings.xml` (`<resolutionFullscreen>`) to this size, keeping one `settings.xml.bak`. The title lays out its UI for the **saved** size, not the presented one: a 4K save on a 1080p screen makes the UI twice too big, and the compositor's 4K→1080p downsample blurs the text (`clankenjoyer/scarlet-fps` 000954708c, `-Res`). Unset: no change. `=restore` copies the backup back. Touches only the title's user data under the configured data dir, never the game package |
 | `VICTORY_TEXTURE_MAX=<pixels>` | cap a sampled host texture's largest side by leaving out its top mips (power-of-two 2D sampled textures only; never below 256 px). `auto` = 1024, dropping to 512 above 92% and 256 above 97% of the card's DXGI budget. Unset: title sizes unchanged. The largest memory win |
 | `VICTORY_TEXTURE_MB=<n>` | per-texture host allocation budget in MiB, clamped to VRAM/4 (the small-VRAM preset rule). Top mips are left out until the estimated allocation fits; combines with `VICTORY_TEXTURE_MAX`. Unset: no byte budget |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | record what the title plays |

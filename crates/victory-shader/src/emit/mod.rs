@@ -271,6 +271,10 @@ fn parse_loop_limit(value: Option<&str>) -> u32 {
     }
 }
 
+/// `SFI0` feature bit of a shader that reads barycentrics (`SV_Barycentrics`
+/// or `GetAttributeAtVertex`).
+pub const SFI0_BARYCENTRICS: u64 = 0x2_0000;
+
 /// A translated shader and what the host binds for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostShader {
@@ -333,6 +337,19 @@ impl HostShader {
             .max()
             .unwrap_or(0);
         n.next_multiple_of(4)
+    }
+
+    /// Whether the emitted DXIL declares barycentrics in its `SFI0` part.
+    /// A container without readable feature flags counts as not needing
+    /// them; this only reads the declaration, it never refuses a shader.
+    pub fn needs_barycentrics(&self) -> bool {
+        Container::parse(&self.dxil)
+            .ok()
+            .and_then(|c| {
+                let data = c.part(FourCC::SFI0)?.data.get(..8)?;
+                Some(u64::from_le_bytes(data.try_into().ok()?))
+            })
+            .is_some_and(|features| features & SFI0_BARYCENTRICS != 0)
     }
 }
 
@@ -652,6 +669,34 @@ mod tests {
         for bad in ["", "0", "-5", "lots", "0x", "4294967296"] {
             assert_eq!(parse_loop_limit(Some(bad)), LOOP_LIMIT, "{bad:?}");
         }
+    }
+
+    /// The probe reads only the barycentrics bit of the emitted `SFI0`.
+    #[test]
+    fn sfi0_barycentrics_bit_is_read_from_the_feature_flags() {
+        let shader = |parts: &[(FourCC, &[u8])]| HostShader {
+            stage: HwStage::Ps,
+            dxil: crate::dxbc::build(parts),
+            user_data: Vec::new(),
+            samplers: Vec::new(),
+            static_samplers: Vec::new(),
+            root_cbvs: Vec::new(),
+            root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
+            memory: false,
+            memory_writes: false,
+            view_addresses: false,
+            heap: false,
+            heap_writes: false,
+            mesh_emu: None,
+            view_marks: false,
+        };
+        let with = |features: u64| shader(&[(FourCC::SFI0, &features.to_le_bytes())]);
+        assert!(!with(0x200).needs_barycentrics());
+        assert!(with(SFI0_BARYCENTRICS).needs_barycentrics());
+        assert!(with(0x200 | SFI0_BARYCENTRICS).needs_barycentrics());
+        assert!(!shader(&[]).needs_barycentrics());
+        assert!(!shader(&[(FourCC::SFI0, &[0; 4])]).needs_barycentrics());
     }
     use super::container::SigElement;
     use super::shader::Shader;
@@ -1289,8 +1334,9 @@ mod tests {
             true,
         );
         let osg1 = container::signature(&[el("SV_Target", 16, 0)], false);
-        emit_pixel(&words, vec![], 1 << 1 | 1 << 8, &isg1, &osg1)
+        let out = emit_pixel(&words, vec![], 1 << 1 | 1 << 8, &isg1, &osg1)
             .expect("the barycentric input reaches the export through a join");
+        assert!(out.needs_barycentrics(), "SFI0: no barycentrics bit");
     }
 
     /// A float4 element per row (16-bit ones declared so in the part).

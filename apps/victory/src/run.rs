@@ -35,6 +35,167 @@ fn check_cpu_features() -> Result<()> {
     check_cpu_features_with(has_avx2, skip.as_deref())
 }
 
+/// `VICTORY_UI_RESOLUTION=WIDTHxHEIGHT` sets the screen size the title saved
+/// in its own settings (`settings.xml`, `<resolutionFullscreen>`) *before* it
+/// starts. The title lays its interface out for that saved size, not for the
+/// size we present: a save made at 4K gives a twice-too-big UI at 1080p, which
+/// our PresentX compositor then downsamples into a blur. This is the host-side
+/// equivalent of `clankenjoyer/scarlet-fps` 000954708c (`-Res` follows the
+/// drawn size). `restore` puts back the one backup. Nothing in the game
+/// package is touched: only the title's user data under the configured data
+/// dir, and only when actually executing the title.
+#[cfg(any(windows, test))]
+#[derive(Debug, PartialEq, Eq)]
+enum UiResolution {
+    Leave,
+    Set(u32, u32),
+    Restore,
+}
+
+#[cfg(any(windows, test))]
+fn ui_resolution(value: Option<&str>) -> UiResolution {
+    let Some(raw) = value else {
+        return UiResolution::Leave;
+    };
+    let raw = raw.trim();
+    if raw.eq_ignore_ascii_case("restore") {
+        return UiResolution::Restore;
+    }
+    let Some((width, height)) = raw.split_once(['x', 'X']) else {
+        eprintln!("ignoring VICTORY_UI_RESOLUTION={raw:?}; expected WIDTHxHEIGHT or restore");
+        return UiResolution::Leave;
+    };
+    match (width.trim().parse::<u32>(), height.trim().parse::<u32>()) {
+        (Ok(width), Ok(height)) if width > 0 && height > 0 => UiResolution::Set(width, height),
+        _ => {
+            eprintln!("ignoring VICTORY_UI_RESOLUTION={raw:?}; expected positive WIDTHxHEIGHT");
+            UiResolution::Leave
+        }
+    }
+}
+
+/// What changing `<resolutionFullscreen>` would do to a settings file.
+#[cfg(any(windows, test))]
+#[derive(Debug, PartialEq, Eq)]
+enum SavedResolution {
+    /// No such block, or not the expected `value="digits"` fields.
+    Malformed,
+    /// Already the requested size: no write, no backup.
+    Already,
+    /// New text and the previously saved size.
+    Changed(String, u32, u32),
+}
+
+#[cfg(any(windows, test))]
+fn dimension(section: &str, tag: &str) -> Option<u32> {
+    let needle = format!("<{tag} value=\"");
+    let start = section.find(&needle)? + needle.len();
+    let end = start + section[start..].find('"')?;
+    section[start..end].parse().ok()
+}
+
+#[cfg(any(windows, test))]
+fn set_dimension(section: &str, tag: &str, value: u32) -> Option<String> {
+    let needle = format!("<{tag} value=\"");
+    let start = section.find(&needle)? + needle.len();
+    let end = start + section[start..].find('"')?;
+    Some(format!("{}{}{}", &section[..start], value, &section[end..]))
+}
+
+#[cfg(any(windows, test))]
+fn set_saved_resolution(text: &str, width: u32, height: u32) -> SavedResolution {
+    const OPEN: &str = "<resolutionFullscreen>";
+    const CLOSE: &str = "</resolutionFullscreen>";
+    let Some(after_open) = text.find(OPEN).map(|i| i + OPEN.len()) else {
+        return SavedResolution::Malformed;
+    };
+    let Some(close) = text[after_open..].find(CLOSE).map(|i| after_open + i) else {
+        return SavedResolution::Malformed;
+    };
+    let section = &text[after_open..close];
+    let (Some(old_width), Some(old_height)) =
+        (dimension(section, "width"), dimension(section, "height"))
+    else {
+        return SavedResolution::Malformed;
+    };
+    if (old_width, old_height) == (width, height) {
+        return SavedResolution::Already;
+    }
+    let Some(with_width) = set_dimension(section, "width", width) else {
+        return SavedResolution::Malformed;
+    };
+    let Some(changed) = set_dimension(&with_width, "height", height) else {
+        return SavedResolution::Malformed;
+    };
+    SavedResolution::Changed(
+        format!("{}{}{}", &text[..after_open], changed, &text[close..]),
+        old_width,
+        old_height,
+    )
+}
+
+#[cfg(windows)]
+fn apply_ui_resolution(storage: &Path, action: UiResolution) {
+    let settings = storage.join("settings").join("settings.xml");
+    // Exactly one backup, kept even across repeated runs with the switch on.
+    let mut backup_name = settings.as_os_str().to_owned();
+    backup_name.push(".bak");
+    let backup = std::path::PathBuf::from(backup_name);
+    match action {
+        UiResolution::Leave => {}
+        UiResolution::Set(width, height) => {
+            let text = match std::fs::read_to_string(&settings) {
+                Ok(text) => text,
+                Err(e) => {
+                    eprintln!("ui resolution: cannot read {}: {e}", settings.display());
+                    return;
+                }
+            };
+            let (new, old_width, old_height) = match set_saved_resolution(&text, width, height) {
+                SavedResolution::Changed(new, old_width, old_height) => {
+                    (new, old_width, old_height)
+                }
+                SavedResolution::Already => return,
+                SavedResolution::Malformed => {
+                    eprintln!(
+                        "ui resolution: no <resolutionFullscreen> width/height in {}",
+                        settings.display()
+                    );
+                    return;
+                }
+            };
+            if !backup.exists() {
+                if let Err(e) = std::fs::copy(&settings, &backup) {
+                    eprintln!("ui resolution: cannot back up {}: {e}", settings.display());
+                    return;
+                }
+            }
+            match std::fs::write(&settings, new.as_bytes()) {
+                Ok(()) => println!(
+                    "ui resolution saved {old_width}x{old_height} -> {width}x{height} in {} (backup: {})",
+                    settings.display(),
+                    backup.display()
+                ),
+                Err(e) => eprintln!("ui resolution: cannot write {}: {e}", settings.display()),
+            }
+        }
+        UiResolution::Restore => {
+            if !backup.is_file() {
+                eprintln!("ui resolution: no backup at {}", backup.display());
+                return;
+            }
+            match std::fs::copy(&backup, &settings) {
+                Ok(_) => println!(
+                    "ui resolution restored {} from {}",
+                    settings.display(),
+                    backup.display()
+                ),
+                Err(e) => eprintln!("ui resolution: cannot restore {}: {e}", settings.display()),
+            }
+        }
+    }
+}
+
 #[cfg(windows)]
 pub fn run(
     exe: &Path,
@@ -99,6 +260,14 @@ pub fn run(
         storage.display(),
         title.storage_bytes >> 20
     );
+    // Before any title code (including its DLLs) reads its settings. A no-op
+    // unless the user opted in, and never touches the game package.
+    if execute {
+        apply_ui_resolution(
+            &storage,
+            ui_resolution(std::env::var("VICTORY_UI_RESOLUTION").ok().as_deref()),
+        );
+    }
     // The console's fixed drives: the package as `G:`, temporary files `T:`.
     victory_hle::modules::files::mount_at('G', title_dir);
     let temp = cfg.data_subdir(&format!("{:08X}/temp", title.id))?;
@@ -608,4 +777,71 @@ fn from_hex(s: &str) -> Result<Vec<u8>> {
         .step_by(2)
         .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(anyhow::Error::from))
         .collect()
+}
+
+#[cfg(test)]
+mod ui_resolution_tests {
+    use super::*;
+
+    const XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<rage__fwSystemSettingsCollection>
+  <uiResolution>
+    <width value="0" />
+    <height value="0" />
+  </uiResolution>
+  <graphics>
+    <width value="111" />
+    <height value="222" />
+  </graphics>
+  <resolutionFullscreen>
+    <width value="3840" />
+    <height value="2160" />
+  </resolutionFullscreen>
+  <tripleBuffered value="false" />
+</rage__fwSystemSettingsCollection>
+"#;
+
+    #[test]
+    fn switch_is_opt_in_and_reversible() {
+        assert_eq!(ui_resolution(None), UiResolution::Leave);
+        assert_eq!(ui_resolution(Some("0")), UiResolution::Leave);
+        assert_eq!(ui_resolution(Some("1920x1080")), UiResolution::Set(1920, 1080));
+        assert_eq!(ui_resolution(Some(" 1920 X 1080 ")), UiResolution::Set(1920, 1080));
+        assert_eq!(ui_resolution(Some("RESTORE")), UiResolution::Restore);
+        for bad in ["", "1920", "0x1080", "1920xabc", "1x2x3"] {
+            assert_eq!(ui_resolution(Some(bad)), UiResolution::Leave, "{bad}");
+        }
+    }
+
+    #[test]
+    fn only_the_saved_screen_size_changes() {
+        let SavedResolution::Changed(new, 3840, 2160) = set_saved_resolution(XML, 1920, 1080)
+        else {
+            panic!("settings.xml was not changed");
+        };
+        assert!(new.contains("<uiResolution>\n    <width value=\"0\" />\n    <height value=\"0\" />"));
+        assert!(new.contains("<graphics>\n    <width value=\"111\" />\n    <height value=\"222\" />"));
+        assert!(new.contains("<resolutionFullscreen>\n    <width value=\"1920\" />\n    <height value=\"1080\" />"));
+        assert!(new.contains("<tripleBuffered value=\"false\" />"));
+    }
+
+    #[test]
+    fn unchanged_size_and_bad_xml_are_not_written() {
+        assert_eq!(
+            set_saved_resolution(XML, 3840, 2160),
+            SavedResolution::Already
+        );
+        assert_eq!(
+            set_saved_resolution("<nope />", 1920, 1080),
+            SavedResolution::Malformed
+        );
+        assert_eq!(
+            set_saved_resolution(
+                "<resolutionFullscreen><width value=\"a\" /><height value=\"2160\" /></resolutionFullscreen>",
+                1920,
+                1080
+            ),
+            SavedResolution::Malformed
+        );
+    }
 }

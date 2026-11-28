@@ -6,6 +6,7 @@
 //! the immediate samplers, and directly indexed heaps.
 
 use std::ffi::{CStr, CString};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use victory_shader::emit::{
@@ -18,7 +19,7 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::core::PCSTR;
 
 use super::{Shader, Translated};
-use crate::host::host;
+use crate::host::{Host, host};
 
 /// A stream's graphics state, owned (the title's stream lives only for the
 /// creation call). Subobjects the stream leaves out keep D3D12's defaults.
@@ -564,6 +565,42 @@ fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline>
     None
 }
 
+/// Log-only barycentric capability probe: one line at the first graphics PSO
+/// creation (successful or refused), with the host's support, how many of
+/// that PSO's stages declare barycentrics, and how many graphics PSOs with
+/// such shaders have been refused so far. No switch, no change to PSO
+/// creation or to the shader cache.
+fn barycentrics_probe(host: &Host, needing: usize, refused: bool) {
+    static NEEDING: AtomicUsize = AtomicUsize::new(0);
+    static REFUSED: AtomicUsize = AtomicUsize::new(0);
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+    NEEDING.fetch_add(needing, Ordering::Relaxed);
+    if refused {
+        REFUSED.fetch_add(1, Ordering::Relaxed);
+    }
+    if LOGGED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let supported = host.barycentrics();
+    let needing = NEEDING.load(Ordering::Relaxed);
+    let refused = REFUSED.load(Ordering::Relaxed);
+    if refused > 0 {
+        tracing::warn!(
+            supported,
+            needing,
+            refused,
+            "barycentric capability probe (graphics PSO refused)"
+        );
+    } else {
+        tracing::info!(
+            supported,
+            needing,
+            refused,
+            "barycentric capability probe (graphics PSO created)"
+        );
+    }
+}
+
 impl HostPipeline {
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.
@@ -606,6 +643,14 @@ impl HostPipeline {
         for (s, _) in &stages {
             s.translated()?;
         }
+        // Diagnostic only: stages of this PSO declaring barycentrics.
+        let bary_need = stages
+            .iter()
+            .filter(|(s, _)| {
+                s.translated()
+                    .is_some_and(|t| t.host.needs_barycentrics())
+            })
+            .count();
         // `SFI0`: 64-bit atomics on typed resources and on heap resources.
         let atomics64 = stages.iter().any(|(s, _)| {
             let Some(t) = s.translated() else {
@@ -837,10 +882,12 @@ impl HostPipeline {
                     inputs = g.inputs.len(),
                     "host pipeline refused (graphics)"
                 );
+                barycentrics_probe(host, bary_need, true);
                 host.log_messages();
                 return None;
             }
         };
+        barycentrics_probe(host, bary_need, false);
         tracing::info!(
             ?shaders,
             ms = started.elapsed().as_millis(),

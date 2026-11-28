@@ -668,8 +668,10 @@ pub(crate) struct HostList {
     /// data (see [`HostList::is_node`]).
     id: u64,
     /// The work its indirect executions may still do (`indirect`): a
-    /// shader-writable word, zeroed when the list is submitted.
-    budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    /// shader-writable word, zeroed when the list is submitted. With
+    /// `VICTORY_BUDGET_PACK` it is a 256-byte slot of a shared slab, held
+    /// until the submissions using it are done ([`Budget`]).
+    budget: OnceLock<Option<Budget>>,
     /// Whether `Close` has sealed the list (until `reset` reopens it): a
     /// second close is a no-op, as the console API tolerates from the
     /// title's error paths, instead of the E_FAIL D3D12 gives.
@@ -698,6 +700,143 @@ type Note = (String, Option<(u64, u64)>);
 
 type States =
     std::collections::HashMap<usize, (u32, u32, std::sync::Arc<crate::resource::HostTexture>)>;
+
+/// Whether indirect-work budgets are 256-byte slots cut from shared 64 KiB
+/// buffers (`VICTORY_BUDGET_PACK`, on by default; `=0` gives each list a
+/// buffer of its own). A budget is a root view shaders write through, so no
+/// barrier names its buffer, and a committed buffer costs 64 KiB however
+/// small: lists made while playing pinned megabytes of 256-byte budgets. A
+/// slot is zeroed when taken and returned after the submissions running when
+/// its list goes ([`retire_budget`]).
+fn budget_pack() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = !matches!(std::env::var("VICTORY_BUDGET_PACK").as_deref(), Ok("0"));
+        tracing::info!(enabled = on, "packed indirect-work budgets");
+        on
+    })
+}
+
+const BUDGET_SLOT: u64 = 256;
+const BUDGET_SLAB: u64 = 64 << 10;
+
+/// The shared buffers (buffer, mapping) and their free slots (buffer, offset).
+struct BudgetSlabs(Vec<(ID3D12Resource, usize)>, Vec<(usize, u64)>);
+
+// SAFETY: D3D12 objects are free-threaded; the mappings are only addresses.
+unsafe impl Send for BudgetSlabs {}
+// SAFETY: as above.
+unsafe impl Sync for BudgetSlabs {}
+
+static BUDGET_SLABS: Mutex<BudgetSlabs> = Mutex::new(BudgetSlabs(Vec::new(), Vec::new()));
+
+/// Slots returned by lists that may still be in a running submission.
+static RETIRED_BUDGETS: Mutex<Vec<(usize, u64)>> = Mutex::new(Vec::new());
+
+/// Gives a slot back only after a submission has run and nothing reads it.
+fn retire_budget(slot: (usize, u64)) {
+    RETIRED_BUDGETS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(slot);
+}
+
+/// A slot's lifetime: returned to the free list when its list goes.
+struct BudgetSlot(usize, u64);
+
+impl Drop for BudgetSlot {
+    fn drop(&mut self) {
+        retire_budget((self.0, self.1));
+    }
+}
+
+/// A host list's indirect-work budget: its buffer, the offset of its 256
+/// bytes in it, and the mapped bytes at that offset.
+struct Budget {
+    buffer: ID3D12Resource,
+    offset: u64,
+    data: usize,
+    _slot: Option<BudgetSlot>,
+}
+
+impl Budget {
+    fn new() -> Option<Budget> {
+        if !budget_pack() {
+            let (buffer, data) = host()?.shared_buffer(BUDGET_SLOT)?;
+            return Some(Budget {
+                buffer,
+                offset: 0,
+                data: data as usize,
+                _slot: None,
+            });
+        }
+        let (slab, offset) = {
+            let mut slabs = BUDGET_SLABS.lock().unwrap_or_else(|e| e.into_inner());
+            if slabs.1.is_empty() {
+                // One slab serves 256 lists. If D3D12 refuses it, fall back
+                // to a buffer of our own rather than leave a draw without a
+                // budget (the baseline behaviour).
+                let (buffer, data) = match host().and_then(|h| h.shared_buffer(BUDGET_SLAB)) {
+                    Some(allocated) => allocated,
+                    None => {
+                        let (buffer, data) = host()?.shared_buffer(BUDGET_SLOT)?;
+                        return Some(Budget {
+                            buffer,
+                            offset: 0,
+                            data: data as usize,
+                            _slot: None,
+                        });
+                    }
+                };
+                name(&buffer, || "indirect budgets".into());
+                let at = slabs.0.len();
+                slabs.0.push((buffer, data as usize));
+                // Taken from the front: the slab's first slot first.
+                slabs.1.extend((0..BUDGET_SLAB / BUDGET_SLOT).rev().map(|k| (at, k * BUDGET_SLOT)));
+            }
+            slabs.1.pop()?
+        };
+        let (buffer, base) = {
+            let slabs = BUDGET_SLABS.lock().unwrap_or_else(|e| e.into_inner());
+            slabs.0[slab].clone()
+        };
+        let data = base + offset as usize;
+        // A returned slot holds its last list's words: zero it, as a fresh
+        // buffer would be.
+        // SAFETY: this slot's 256 mapped bytes are ours until we return it.
+        unsafe { std::ptr::write_bytes(data as *mut u8, 0, BUDGET_SLOT as usize) };
+        Some(Budget {
+            buffer,
+            offset,
+            data,
+            _slot: Some(BudgetSlot(slab, offset)),
+        })
+    }
+
+    fn gpu(&self) -> u64 {
+        // SAFETY: a live buffer.
+        unsafe { self.buffer.GetGPUVirtualAddress() + self.offset }
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    /// A slab holds 256 budgets, and a slot returned by a list waits in the
+    /// retire queue until a submission has run.
+    #[test]
+    fn a_budget_slot_is_bounded_and_comes_back() {
+        assert_eq!(BUDGET_SLAB / BUDGET_SLOT, 256);
+        retire_budget((usize::MAX, 3 * BUDGET_SLOT));
+        let mut retired = RETIRED_BUDGETS.lock().unwrap();
+        let at = retired
+            .iter()
+            .position(|&slot| slot == (usize::MAX, 3 * BUDGET_SLOT))
+            .expect("the slot is waiting for a submission");
+        retired.remove(at);
+    }
+}
 
 /// Whether device-removed data is on (`VICTORY_D3D12_DRED`, diagnostics
 /// builds).
@@ -1001,6 +1140,28 @@ impl Host {
                 && heap.AtomicInt64OnDescriptorHeapResourceSupported.as_bool();
             tracing::info!(atomics, "host 64-bit atomics on typed heap resources");
             atomics
+        })
+    }
+
+    /// Whether pixel shaders may declare barycentrics (`SV_Barycentrics` and
+    /// `GetAttributeAtVertex`): `D3D12_FEATURE_DATA_D3D12_OPTIONS3
+    /// .BarycentricsSupported`; logged once. Diagnostic only — no switch.
+    pub(crate) fn barycentrics(&self) -> bool {
+        static BARYCENTRICS: OnceLock<bool> = OnceLock::new();
+        *BARYCENTRICS.get_or_init(|| {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS3::default();
+            // SAFETY: the query writes its own structure of the given size.
+            let ok = unsafe {
+                self.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS3,
+                    (&raw mut options).cast(),
+                    size_of_val(&options) as u32,
+                )
+            }
+            .is_ok();
+            let supported = ok && options.BarycentricsSupported.as_bool();
+            tracing::info!(barycentrics = supported, ok, "host barycentric support");
+            supported
         })
     }
 
@@ -2165,24 +2326,17 @@ impl HostList {
     /// The host address of the list's indirect-work budget, zeroed at each
     /// submission of the list from the first use after a reset on.
     pub(crate) fn budget(&self) -> Option<u64> {
-        let (buffer, data) = self
-            .budget
-            .get_or_init(|| {
-                let (b, d) = host()?.shared_buffer(256)?;
-                Some((b, d as usize))
-            })
-            .as_ref()?;
+        let budget = self.budget.get_or_init(Budget::new).as_ref()?;
         let mut deferred = self.deferred();
         if !deferred.budget_zeroed {
             deferred.budget_zeroed = true;
-            let at = *data;
+            let at = budget.data;
             // SAFETY: the list's own mapped word, written before it runs.
             deferred.copies.push(Step::Host(Box::new(move || unsafe {
                 (at as *mut u32).write_volatile(0)
             })));
         }
-        // SAFETY: a live buffer.
-        Some(unsafe { buffer.GetGPUVirtualAddress() })
+        Some(budget.gpu())
     }
 
     /// Keeps `object` alive until the list is reset.
@@ -3042,6 +3196,7 @@ impl Meter {
         let dropped = crate::draw::take_dropped() as f64 / frames;
         let indirect = crate::list::take_indirect() as f64 / frames;
         let root_views = crate::draw::take_root_view_slots() as f64 / frames;
+        let root_constants = crate::draw::take_root_constant_dword4() as f64 / frames;
         // Over the same frames as the counts above.
         #[cfg(feature = "diagnostics")]
         let drops = crate::pipeline::take_drops();
@@ -3052,7 +3207,8 @@ impl Meter {
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
                  GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
                  dropped {dropped:.0} without a host pipeline ({making} being made) and \
-                 {indirect:.0} indirect; {root_views:.0} root-view slots/frame",
+                 {indirect:.0} indirect; {root_views:.0} root-view slots/frame, \
+                 {root_constants:.0} root-constant dword 4s/frame",
                 making = crate::pipeline::making()
             );
             let (textures, bytes, used, shared, saved, replaced) =
@@ -3871,6 +4027,14 @@ pub(crate) fn retire(resource: ID3D12Resource) {
 pub(crate) fn release_retired() {
     let retired = std::mem::take(&mut *RETIRED.lock().unwrap_or_else(|e| e.into_inner()));
     drop(retired);
+    // Budget slots are plain (buffer, offset) pairs: give them back only now
+    // that the submissions which used them have run.
+    let slots = std::mem::take(&mut *RETIRED_BUDGETS.lock().unwrap_or_else(|e| e.into_inner()));
+    BUDGET_SLABS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .1
+        .extend(slots);
 }
 
 /// Diagnostics: a noted command running a shader `VICTORY_TRACE_SHADERS`

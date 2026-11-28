@@ -13,7 +13,12 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
+/// Host heap generation. A list recorded against a heap that has since been
+/// destroyed must not give back ranges in a new heap at the same address.
+static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 pub(crate) struct HostHeap {
+    id: u64,
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
     step: u32,
@@ -186,6 +191,7 @@ impl HostHeap {
             sampler,
         ));
         let h = HostHeap {
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             heap,
             cpu,
             step,
@@ -358,7 +364,7 @@ impl HostHeap {
         if index >= self.count + self.dynamic {
             self.pairs.lock().unwrap_or_else(|e| e.into_inner()).1.push(index);
         } else {
-            self.release(index, 2);
+            self.release(self.id, index, 2);
         }
     }
 
@@ -368,18 +374,48 @@ impl HostHeap {
         self.count
     }
 
+    /// This heap's generation, kept with the ranges lists take from it.
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
-    /// returned).
+    /// returned), for the heap generation `id` that took them. A list from a
+    /// heap that has gone cannot release slots in a new one at the same
+    /// address. The resources those slots viewed go too: keeping them in
+    /// `kept` after the slot is free pinned host copies that nothing reads
+    /// any more (upstream itkomarov/dirtemu `4c1c518e3f`).
     ///
     /// [`dynamic`]: HostHeap::dynamic
-    pub(crate) fn release(&self, first: u32, n: u32) {
+    pub(crate) fn release(&self, id: u64, first: u32, n: u32) {
+        if id != self.id {
+            return;
+        }
         let Some(at) = first.checked_sub(self.count) else {
             return;
         };
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let end = (at + n).min(self.dynamic) as usize;
+        let end = at.saturating_add(n).min(self.dynamic) as usize;
         if let Some(slots) = guard.1.get_mut(at as usize..end) {
             slots.fill(false);
+        }
+        drop(guard);
+        let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+        let mut retired = Vec::new();
+        for slot in kept
+            .iter_mut()
+            .skip(self.count as usize + at as usize)
+            .take(end - at as usize)
+        {
+            if let Some((resource, _)) = slot.take() {
+                retired.push(resource);
+            }
+        }
+        drop(kept);
+        for resource in retired {
+            // A submission that took the old descriptor may still be running;
+            // `retire` holds the resource until it has gone.
+            crate::host::retire(resource);
         }
     }
 
@@ -1747,7 +1783,7 @@ mod tests {
         assert_eq!((a, b), (4, 4 + heap.dynamic - 100));
         // 40 left at the end: 50 do not fit until something is given back.
         assert_eq!(heap.dynamic(50), None);
-        heap.release(a, 50);
+        heap.release(heap.id(), a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
     }
@@ -1765,17 +1801,73 @@ mod tests {
         assert_eq!((first, left, right, rest), (4, 5, 7, 9));
 
         // Reallocating the left half puts the cursor back in the middle.
-        heap.release(left, 2);
+        heap.release(heap.id(), left, 2);
         assert_eq!(heap.dynamic(2), Some(left));
-        heap.release(left, 2);
-        heap.release(right, 2);
+        heap.release(heap.id(), left, 2);
+        heap.release(heap.id(), right, 2);
         assert_eq!(heap.dynamic(4), Some(left));
         assert_eq!(heap.dynamic(1), None);
 
         // A free slot at each physical end does not form a two-slot range.
-        heap.release(first, 1);
+        heap.release(heap.id(), first, 1);
         let last = first + heap.dynamic - 1;
-        heap.release(last, 1);
+        heap.release(heap.id(), last, 1);
         assert_eq!(heap.dynamic(2), None);
+    }
+
+    /// A list from a destroyed heap (same address, new generation) cannot
+    /// release this heap's ranges. A slot given back also stops pinning the
+    /// resource it viewed; the resource is retired, not freed while a
+    /// submission that took the old descriptor may still be running.
+    #[test]
+    fn released_dynamic_ranges_retire_their_resource_for_the_right_generation() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let slot = heap.dynamic(1).unwrap();
+        let rest = heap.dynamic(heap.dynamic - 1).unwrap();
+        assert_eq!((slot, rest), (4, 5));
+        unsafe {
+            let host = host().unwrap();
+            let mut buffer: Option<ID3D12Resource> = None;
+            host.device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                        Width: 256,
+                        Height: 1,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                        ..Default::default()
+                    },
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut buffer,
+                )
+                .unwrap();
+            let buffer = buffer.unwrap();
+            let references = |b: &ID3D12Resource| {
+                let raw = windows::core::Interface::as_raw(b);
+                let unknown = &*(raw as *const *const windows::core::IUnknown_Vtbl);
+                ((**unknown).AddRef)(raw);
+                ((**unknown).Release)(raw)
+            };
+            heap.raw_view_at(slot, Some(&buffer), 0, 256, false);
+            assert_eq!(references(&buffer), 2, "ours and the slot's");
+
+            heap.release(heap.id() + 1, slot, 1);
+            assert_eq!(heap.dynamic(1), None, "a stale list freed nothing");
+            assert_eq!(references(&buffer), 2, "and pinned nothing");
+
+            heap.release(heap.id(), slot, 1);
+            assert_eq!(heap.dynamic(1), Some(slot));
+            assert!(references(&buffer) >= 2, "the slot's, retired");
+            crate::host::release_retired();
+            assert_eq!(references(&buffer), 1, "ours");
+        }
     }
 }

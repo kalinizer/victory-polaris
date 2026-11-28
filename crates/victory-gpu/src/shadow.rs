@@ -17,7 +17,7 @@
 //! (`crate::bindless`).
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
@@ -46,6 +46,11 @@ pub(crate) struct Shadow {
     /// 64 KiB title page it touches (tracked memory only): writes through
     /// views of it are marked there ([`Shadow::mark_entry`]).
     marks: Option<u32>,
+    /// Last use, in milliseconds ([`crate::host::now_ms`]). A registered
+    /// buffer's copy is not its registration: a cold one that no view, list
+    /// or pending write holds is given back under memory pressure and made
+    /// again on the next look ([`release_unused_buffers`]).
+    used: std::sync::atomic::AtomicU64,
 }
 
 /// Snapshot segments (offset, bytes) and the pieces compared.
@@ -242,7 +247,7 @@ fn reclaim_at() -> u64 {
 
 /// Number of loose windows currently in the map (diagnostics and ceiling).
 fn loose_len() -> usize {
-    LOOSE.lock().unwrap_or_else(|e| e.into_inner()).len()
+    LOOSE.read().unwrap_or_else(|e| e.into_inner()).len()
 }
 
 /// Whether one more copy of `size` bytes may be made.
@@ -265,6 +270,86 @@ fn shadow_room(size: u64) -> bool {
         );
     });
     false
+}
+
+/// Whether a cold copy of a registered buffer may be given back while its
+/// title buffer stays registered (`VICTORY_BUFFER_COPY_RECLAIM`, on by
+/// default; `=0` keeps the old behaviour: a registered copy lives until the
+/// title unregisters the buffer). Adapted from itkomarov/dirtemu `4c1c518e3f`:
+/// host copies pinned only by their registration were refused under pressure
+/// while windows were evicted instead.
+pub(crate) fn buffer_copy_reclaim() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let on = !matches!(std::env::var("VICTORY_BUFFER_COPY_RECLAIM").as_deref(), Ok("0"));
+        tracing::info!(enabled = on, "registered-buffer copy reclamation");
+        on
+    })
+}
+
+/// How long a registered buffer's copy may go untouched before the idle
+/// sweep gives it back (`VICTORY_BUFFER_COPY_IDLE_MS`, default 10 s). Pressure
+/// reclamation ignores this age.
+fn buffer_copy_idle_ms() -> u64 {
+    static IDLE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *IDLE.get_or_init(|| {
+        std::env::var("VICTORY_BUFFER_COPY_IDLE_MS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(10_000)
+    })
+}
+
+/// Bytes of cold registered-buffer copies given back: since the start, and
+/// since the last frame log.
+static BUFFER_RECLAIMED: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// A copy no list, slot or pending write is using. This baseline has no
+/// card-side twin, so only our own owners need checking: a descriptor slot
+/// holds an `Arc<Shadow>` in its `kept` entry, and a view or a list its own.
+fn unused_copy(shadow: &Arc<Shadow>) -> bool {
+    Arc::strong_count(shadow) == 1
+        && shadow.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+}
+
+/// Gives back up to `needed` bytes of cold registered-buffer copies, oldest
+/// use first. The `Entry` stays: the title buffer is still registered, and
+/// the next [`find`] makes a fresh copy. `idle_ms == 0` takes every unused
+/// copy (pressure); otherwise only ones untouched for that long. Returns
+/// the bytes freed; dropping the last `Arc` updates [`SHADOW_BYTES`].
+fn release_unused_buffers(map: &mut BTreeMap<(u64, usize), Entry>, needed: u64, idle_ms: u64) -> u64 {
+    use std::sync::atomic::Ordering::Relaxed;
+    let now = crate::host::now_ms();
+    let mut candidates: Vec<(u64, (u64, usize))> = map
+        .iter()
+        .filter_map(|(key, entry)| {
+            let shadow = entry.shadow.as_ref()?;
+            let used = shadow.used.load(Relaxed);
+            (unused_copy(shadow) && now.saturating_sub(used) >= idle_ms).then_some((used, *key))
+        })
+        .collect();
+    candidates.sort_unstable();
+    let mut freed = 0;
+    for (_, key) in candidates {
+        if freed >= needed {
+            break;
+        }
+        if let Some(entry) = map.get_mut(&key)
+            && entry.shadow.as_ref().is_some_and(unused_copy)
+            && let Some(shadow) = entry.shadow.take()
+        {
+            freed += shadow.len;
+            drop(shadow);
+        }
+    }
+    if freed != 0 {
+        changed();
+        for count in &BUFFER_RECLAIMED {
+            count.fetch_add(freed, Relaxed);
+        }
+    }
+    freed
 }
 
 // SAFETY: D3D12 resources are free-threaded; `data` is a persistent mapping
@@ -392,6 +477,7 @@ impl Shadow {
             pending: Mutex::default(),
             before: Mutex::default(),
             marks,
+            used: std::sync::atomic::AtomicU64::new(crate::host::now_ms()),
         });
         if let Some(base) = marks {
             self::marks().owners.insert(base, Arc::downgrade(&shadow));
@@ -1035,6 +1121,23 @@ fn find_inner(address: u64, len: u64, count: bool) -> Option<Arc<Shadow>> {
         drop(map);
         return loose(address, end);
     };
+    // The title keeps its buffer registered even when we give its cold copy
+    // back: before refusing this one for the budget, reclaim copies no view,
+    // list or pending write is using (and touch the one we found).
+    let size = {
+        let entry = map.get(&key)?;
+        if let Some(shadow) = &entry.shadow {
+            shadow.used.store(crate::host::now_ms(), std::sync::atomic::Ordering::Relaxed);
+            return entry.shadow.clone();
+        }
+        (entry.end - key.0).next_multiple_of(1 << 16)
+    };
+    if buffer_copy_reclaim() && !shadow_room(size) && size <= card_limits().1 {
+        let needed = SHADOW_BYTES.load(std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(size)
+            .saturating_sub(card_limits().1);
+        release_unused_buffers(&mut map, needed, 0);
+    }
     let entry = map.get_mut(&key)?;
     if entry.shadow.is_none() {
         let len = entry.end - key.0;
@@ -1066,7 +1169,9 @@ fn find_inner(address: u64, len: u64, count: bool) -> Option<Arc<Shadow>> {
         entry.shadow = Some(Shadow::new(buffer, data, gpu, key.0, len));
         changed();
     }
-    entry.shadow.clone()
+    let shadow = entry.shadow.as_ref()?;
+    shadow.used.store(crate::host::now_ms(), std::sync::atomic::Ordering::Relaxed);
+    Some(shadow.clone())
 }
 
 /// The copy holding `address` for a view without a size (a root view, which
@@ -1114,8 +1219,32 @@ pub(crate) fn find_reaching(address: u64, reach: u64) -> Option<Arc<Shadow>> {
 /// with room for a constant view's stream data past its 64 KiB reach.
 const WINDOW: u64 = 1 << 20;
 
-/// Copies of title memory outside buffers, by (start, length).
-static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
+/// Copies of title memory outside buffers, by (start, length). Nearly every
+/// walk only reads it; writers are the creation and eviction paths below.
+static LOOSE: RwLock<BTreeMap<(u64, u64), Arc<Shadow>>> = RwLock::new(BTreeMap::new());
+
+/// Per-key constructor tickets. A thread that missed a cache entry holds its
+/// key's ticket while making the backing buffer, so concurrent misses on the
+/// same key reuse one copy instead of allocating duplicates. Unrelated keys
+/// allocate in parallel and no cache lock is held across D3D12 creation.
+type PendingTickets = Mutex<BTreeMap<(u64, u64), std::sync::Weak<Mutex<()>>>>;
+
+static LOOSE_BUILDING: PendingTickets = Mutex::new(BTreeMap::new());
+
+/// The ticket for `key`, shared by every thread building that key now. The
+/// map keeps weak references so a finished ticket disappears without a sweep.
+fn pending_ticket(table: &PendingTickets, key: (u64, u64)) -> Arc<Mutex<()>> {
+    let mut map = table.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(existing) = map.get(&key).and_then(std::sync::Weak::upgrade) {
+        return existing;
+    }
+    if map.len() >= 64 {
+        map.retain(|_, weak| weak.strong_count() > 0);
+    }
+    let ticket = Arc::new(Mutex::new(()));
+    map.insert(key, Arc::downgrade(&ticket));
+    ticket
+}
 
 /// The aligned window covering `[address, end)`: one cell at minimum, plus
 /// whatever it takes to reach `end` when the view starts near a cell's end.
@@ -1132,17 +1261,21 @@ fn window_for(address: u64, end: u64) -> Option<(u64, u64)> {
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let (start, len) = window_for(address, end)?;
     let key = (start, len);
+    let touch = || {
+        LOOSE_USED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, IDLE_TICK.load(std::sync::atomic::Ordering::Relaxed));
+    };
     {
-        let map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        // The window is there already (nearly always): readers share the lock.
+        let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
         if let Some(shadow) = map.get(&key).cloned() {
             // Release the window map before the use map: `evict_unused`
             // takes them in the same order, but never while holding the
             // other.
             drop(map);
-            LOOSE_USED
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(key, IDLE_TICK.load(std::sync::atomic::Ordering::Relaxed));
+            touch();
             return Some(shadow);
         }
     }
@@ -1154,6 +1287,20 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
         if !shadow_room(len) || at_limit() {
             FIND_LOOSE_BUDGET.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return None;
+        }
+    }
+    // Serialize only the creators of this key: D3D12 creation, residency
+    // confirmation and mapping run with no cache lock held, while unrelated
+    // keys and all read walks proceed in parallel.
+    let ticket = pending_ticket(&LOOSE_BUILDING, key);
+    let _only = ticket.lock().unwrap_or_else(|e| e.into_inner());
+    {
+        let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(shadow) = map.get(&key).cloned() {
+            drop(map);
+            drop(_only);
+            touch();
+            return Some(shadow);
         }
     }
     let (buffer, data) = match host()?.shared_buffer(len) {
@@ -1182,25 +1329,21 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
         "loose memory copied to the host"
     );
     let shadow = Shadow::new(buffer, data, gpu, start, len);
-    {
-        let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(existing) = map.get(&key).cloned() {
-            // Another thread made the same window while we allocated;
-            // keep theirs and let ours go (Shadow::drop accounts for it).
-            drop(map);
-            drop(shadow);
-            LOOSE_USED
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(key, IDLE_TICK.load(std::sync::atomic::Ordering::Relaxed));
-            return Some(existing);
-        }
-        map.insert(key, shadow.clone());
+    let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+    if let Some(existing) = map.get(&key).cloned() {
+        // Another thread published the window while we allocated; keep theirs
+        // and let ours go (Shadow::drop accounts for it). Drop outside the map
+        // so the use-map lock is never taken while LOOSE is held.
+        drop(map);
+        drop(shadow);
+        drop(_only);
+        touch();
+        return Some(existing);
     }
-    LOOSE_USED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(key, IDLE_TICK.load(std::sync::atomic::Ordering::Relaxed));
+    map.insert(key, shadow.clone());
+    drop(map);
+    drop(_only);
+    touch();
     changed();
     Some(shadow)
 }
@@ -1213,7 +1356,7 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
 /// [`SHADOW_BYTES`] before the caller asks [`shadow_room`] again.
 fn evict_unused(age: u64, limit: Option<usize>) -> u64 {
     let tick = IDLE_TICK.load(std::sync::atomic::Ordering::Relaxed);
-    let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
     let mut used = LOOSE_USED.lock().unwrap_or_else(|e| e.into_inner());
     let mut victims: Vec<((u64, u64), u64)> = map
         .iter()
@@ -1261,6 +1404,19 @@ fn evict_unused(age: u64, limit: Option<usize>) -> u64 {
 /// age. Below that, windows idle for [`idle_frames`] ticks still go.
 /// `VICTORY_IDLE_RECLAIM=0` turns it off.
 pub(crate) fn let_go_idle() {
+    // Registered buffers are not loose windows: their copies used to stay
+    // until the title unregistered them, even when no draw read them. Sweep
+    // the cold ones too, so their bytes are back for the root-view windows.
+    if buffer_copy_reclaim() {
+        let freed = release_unused_buffers(&mut buffers(), u64::MAX, buffer_copy_idle_ms());
+        if freed != 0 {
+            tracing::info!(
+                freed_mb = freed >> 20,
+                live_mb = SHADOW_BYTES.load(std::sync::atomic::Ordering::Relaxed) >> 20,
+                "released cold registered-buffer host copies"
+            );
+        }
+    }
     if matches!(std::env::var("VICTORY_IDLE_RECLAIM").as_deref(), Ok("0")) {
         return;
     }
@@ -1345,10 +1501,18 @@ pub(crate) fn log_views(frames: f64) {
             over_window as f64 / frames
         );
     }
+    let [reclaimed, reclaimed_now] = BUFFER_RECLAIMED.each_ref().map(|c| c.swap(0, Relaxed));
+    if reclaimed + reclaimed_now > 0 {
+        tracing::info!(
+            "registered-buffer copies reclaimed: {:.1} MiB since the last line, {:.1} MiB since the start",
+            reclaimed_now as f64 / (1 << 20) as f64,
+            reclaimed as f64 / (1 << 20) as f64
+        );
+    }
     // The window cache itself: a count and byte total per frame, so a
     // leak/race shows up as growth before `shared_buffer` starts to fail.
     let (windows, bytes) = {
-        let map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
         (map.len(), map.values().map(|s| s.len).sum::<u64>())
     };
     if windows > 0 {
@@ -1370,26 +1534,58 @@ pub(crate) fn log_views(frames: f64) {
 #[allow(clippy::type_complexity)]
 static EXACT: Mutex<(usize, BTreeMap<(u64, u64), std::sync::Weak<Shadow>>)> = Mutex::new((0, BTreeMap::new()));
 
+/// Per-key constructor tickets for single-view copies, as for loose windows.
+static EXACT_BUILDING: PendingTickets = Mutex::new(BTreeMap::new());
+
 fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
-    let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
-    let (prune_at, map) = &mut *guard;
-    if let Some(shadow) = map.get(&(address, len)).and_then(std::sync::Weak::upgrade) {
-        return Some(shadow);
-    }
-    // Ring positions change every frame: entries die by the hundred.
-    if map.len() >= *prune_at {
-        map.retain(|_, w| w.strong_count() > 0);
-        *prune_at = (2 * map.len()).max(1024);
+    let key = (address, len);
+    {
+        let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+        let (prune_at, map) = &mut *guard;
+        if let Some(shadow) = map.get(&key).and_then(std::sync::Weak::upgrade) {
+            return Some(shadow);
+        }
+        // Ring positions change every frame: entries die by the hundred.
+        if map.len() >= *prune_at {
+            map.retain(|_, w| w.strong_count() > 0);
+            *prune_at = (2 * map.len()).max(1024);
+        }
     }
     if !shadow_room(len.next_multiple_of(256)) {
         return None;
     }
-    let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
+    // The allocation used to run with EXACT held, serializing every view off
+    // its elements behind it. Only the builders of this key wait on its
+    // ticket; the shared buffer is made with no cache lock held.
+    let ticket = pending_ticket(&EXACT_BUILDING, key);
+    let _only = ticket.lock().unwrap_or_else(|e| e.into_inner());
+    {
+        let guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(shadow) = guard.1.get(&key).and_then(std::sync::Weak::upgrade) {
+            drop(guard);
+            drop(_only);
+            return Some(shadow);
+        }
+    }
+    let (buffer, data) = match host()?.shared_buffer(len.next_multiple_of(256)) {
+        Some(allocated) => allocated,
+        None => return None,
+    };
     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     let shadow = Shadow::new(buffer, data, gpu, address, len);
-    map.insert((address, len), Arc::downgrade(&shadow));
+    let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(existing) = guard.1.get(&key).and_then(std::sync::Weak::upgrade) {
+        // Another thread published it while we allocated; keep theirs.
+        drop(guard);
+        drop(shadow);
+        drop(_only);
+        return Some(existing);
+    }
+    guard.1.insert(key, Arc::downgrade(&shadow));
+    drop(guard);
+    drop(_only);
     #[cfg(feature = "diagnostics")]
     {
         use std::sync::atomic::Ordering::Relaxed;
@@ -1403,7 +1599,7 @@ fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
 /// Every host copy of title memory made so far (buffers and windows).
 pub(crate) fn all() -> Vec<Arc<Shadow>> {
     let mut all: Vec<Arc<Shadow>> = buffers().values().filter_map(|e| e.shadow.clone()).collect();
-    all.extend(LOOSE.lock().unwrap_or_else(|e| e.into_inner()).values().cloned());
+    all.extend(LOOSE.read().unwrap_or_else(|e| e.into_inner()).values().cloned());
     all
 }
 
@@ -1416,7 +1612,7 @@ pub(crate) fn near(va: u64) -> String {
         .collect();
     all.extend(
         LOOSE
-            .lock()
+            .read()
             .unwrap_or_else(|e| e.into_inner())
             .values()
             .map(|s| (s.gpu, s.start, s.len)),
@@ -1442,6 +1638,28 @@ pub(crate) fn near(va: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A per-key ticket is shared by concurrent builders of the same key and
+    /// serializes them, while a different key gets its own ticket. Once the
+    /// builders are done the weak map lets the key be taken again.
+    #[test]
+    fn pending_tickets_are_per_key_and_expire() {
+        let table = Mutex::new(BTreeMap::new());
+        let a = pending_ticket(&table, (1, 2));
+        let b = pending_ticket(&table, (1, 2));
+        let c = pending_ticket(&table, (3, 4));
+        assert!(Arc::ptr_eq(&a, &b), "the same key shares one ticket");
+        assert!(!Arc::ptr_eq(&a, &c), "different keys do not");
+        let held = a.lock().unwrap();
+        assert!(b.try_lock().is_err(), "same-key builders serialize");
+        assert!(c.try_lock().is_ok(), "other keys proceed in parallel");
+        drop(held);
+        drop(a);
+        drop(b);
+        drop(c);
+        let fresh = pending_ticket(&table, (1, 2));
+        assert_eq!(Arc::strong_count(&fresh), 1, "an expired ticket is replaced");
+    }
 
     #[test]
     fn card_limits_scale_with_local_vram_budget() {
@@ -1484,6 +1702,60 @@ mod tests {
             !in_buffer(&map, address),
             "the wide buffer is past the 64 nearer entries"
         );
+    }
+
+    /// A real copy for the reclamation test (skips where there is no host).
+    fn test_copy(start: u64, len: u64) -> Option<Arc<Shadow>> {
+        let host = crate::host::host()?;
+        let (buffer, data) = host.shared_buffer(len)?;
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        Some(Shadow::new(buffer, data, gpu, start, len))
+    }
+
+    /// Reclaiming a registered buffer's cold copy keeps its guest entry, so
+    /// the next look makes a new one; copies held by a list, by a pending
+    /// write, or used recently stay. The freed bytes go back to the total.
+    #[test]
+    fn registered_buffer_reclamation_keeps_registration_and_active_copies() {
+        const SIZE: u64 = 65536;
+        // `now_ms` starts at process start: give the clock a little time so
+        // the "cold" copies really are older than the short test window.
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        let now = crate::host::now_ms();
+        let mut map: BTreeMap<(u64, usize), Entry> = BTreeMap::new();
+        for (index, age) in [(1u64, 20_000u64), (2, 20_000), (3, 20_000), (4, 0)] {
+            let start = index * SIZE;
+            let Some(shadow) = test_copy(start, SIZE) else {
+                return; // no host GPU here
+            };
+            shadow.used.store(now.saturating_sub(age), std::sync::atomic::Ordering::Relaxed);
+            map.insert((start, index as usize), Entry { end: start + SIZE, shadow: Some(shadow) });
+        }
+        let key = |index: u64| (index * SIZE, index as usize);
+        let list_pin = map[&key(2)].shadow.as_ref().unwrap().clone();
+        map[&key(3)]
+            .shadow
+            .as_ref()
+            .unwrap()
+            .pending
+            .lock()
+            .unwrap()
+            .insert((0, 8));
+        let before = SHADOW_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(release_unused_buffers(&mut map, SIZE, 50), SIZE);
+        assert_eq!(SHADOW_BYTES.load(std::sync::atomic::Ordering::Relaxed), before - SIZE);
+        assert_eq!(map.len(), 4, "the registration remains");
+        assert!(map[&key(1)].shadow.is_none(), "the old copy went");
+        assert!(map[&key(4)].shadow.is_some(), "a recent copy stays");
+        for index in 2..=3 {
+            assert!(map[&key(index)].shadow.is_some(), "a pinned copy stays");
+        }
+        drop(list_pin);
+        map[&key(3)].shadow.as_ref().unwrap().pending.lock().unwrap().clear();
+        assert_eq!(release_unused_buffers(&mut map, u64::MAX, 0), 3 * SIZE);
+        assert!(map.values().all(|entry| entry.shadow.is_none()));
+        assert_eq!(map[&key(1)].end, 2 * SIZE, "the buffer is still registered");
     }
 
     /// A loose window is shared per 1 MiB cell, covers the view's reach (so

@@ -99,9 +99,10 @@ pub(crate) struct State {
     /// offset in the view heap). The ambient stand-in must find its views
     /// where they were made, not in the title's original slots.
     ambient_tables: Vec<(u8, u32)>,
-    /// The dynamic slots the list holds: title heap, first, count; given
-    /// back when the list is reset or released.
-    dynamic: Vec<(usize, u32, u32)>,
+    /// The dynamic slots the list holds: title heap, heap generation, first,
+    /// count; given back when the list is reset or released. The generation
+    /// stops a list from freeing ranges in a new heap at the same address.
+    dynamic: Vec<(usize, u64, u32, u32)>,
     /// A fresh table of the stage being bound could not be made.
     table_failed: bool,
     /// The title-memory page table made for this list (`crate::memory`)
@@ -120,10 +121,10 @@ pub(crate) struct State {
 
 impl Drop for State {
     fn drop(&mut self) {
-        for &(heap, first, n) in &self.dynamic {
+        for &(heap, id, first, n) in &self.dynamic {
             match (heap, crate::memory::heap()) {
-                (MEMORY_HEAP, Some(ours)) => ours.release(first, n),
-                _ => crate::descriptor::release_dynamic(heap, first, n),
+                (MEMORY_HEAP, Some(ours)) => ours.release(id, first, n),
+                _ => crate::descriptor::release_dynamic(heap, id, first, n),
             }
         }
     }
@@ -525,6 +526,13 @@ pub(crate) fn take_dropped() -> u64 {
     DROPPED.swap(0, Ordering::Relaxed)
 }
 static DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Binds whose dword 4 was read as a constant instead of a root view's
+/// offset since the last call (`VICTORY_ROOT_CONSTANT_DWORD4`).
+pub(crate) fn take_root_constant_dword4() -> u64 {
+    ROOT_CONSTANT_DWORD4.swap(0, Ordering::Relaxed)
+}
+static ROOT_CONSTANT_DWORD4: AtomicU64 = AtomicU64::new(0);
 
 /// Marks the last traced draw as not run on the host, counts it by why
 /// (the reason [`not_run`] gave, if its pipeline has a host one) and notes
@@ -1164,7 +1172,12 @@ impl State {
                     .find(|m| m.0 == u.slot && u.root == RootType::Table);
                 values[u.index as usize] = match fresh {
                     Some(&(_, offset)) => offset,
-                    None if u.dword == victory_shader::emit::ROOT_VIEW_OFFSET => {
+                    // A root descriptor's dword 4 takes its view's offset.
+                    // With the fix on, a root constant's or a table's dword 4
+                    // is user data, not an offset (the next arm).
+                    None if u.dword == victory_shader::emit::ROOT_VIEW_OFFSET
+                        && (!root_constant_dword4() || is_root_view_offset(u)) =>
+                    {
                         // Where the root address lies in the copy its view shows.
                         let offset = match self.roots_ref(title_compute).get(usize::from(u.slot)) {
                             Some(&Root::View(address)) => {
@@ -1185,6 +1198,23 @@ impl State {
                                 return false;
                             }
                         }
+                    }
+                    None if u.dword == victory_shader::emit::ROOT_VIEW_OFFSET => {
+                        // Dword 4 of root constants (or of a table) is user
+                        // data, not a root view's offset. The old test took
+                        // it for one and dropped the shader when the slot
+                        // held no root view: eleven of the title's
+                        // post-processing programs every frame.
+                        let n = ROOT_CONSTANT_DWORD4.fetch_add(1, Ordering::Relaxed) + 1;
+                        if cfg!(feature = "diagnostics") && n.is_power_of_two() {
+                            tracing::debug!(
+                                slot = u.slot,
+                                pipeline = name,
+                                recovered = n,
+                                "root constant dword 4 read as a constant"
+                            );
+                        }
+                        self.user_value(title_compute, u.slot, u.root, u.dword)
                     }
                     None if is_root_view(u) => {
                         let uav = u.dword == victory_shader::emit::ROOT_UAV_VIEW;
@@ -1386,7 +1416,7 @@ impl State {
                 once!("no dynamic slots for root views: dropped");
                 return None;
             };
-            self.dynamic.push((key, first, ROOT_VIEW_RUN));
+            self.dynamic.push((key, host.id(), first, ROOT_VIEW_RUN));
             self.root_run = (key, first, first + ROOT_VIEW_RUN);
         }
         let index = self.root_run.1;
@@ -1511,7 +1541,7 @@ impl State {
             return;
         };
         self.dynamic
-            .push((std::ptr::from_ref(heap) as usize, slot, 1));
+            .push((std::ptr::from_ref(heap) as usize, visible.id(), slot, 1));
         visible.make_at(slot, &view);
         let at = host.cpu_view();
         let Some(resource) = crate::descriptor::host::make_view(&view, at) else {
@@ -2115,8 +2145,7 @@ impl State {
                 continue;
             };
             self.fresh_tables.insert(key, first);
-            self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
+            self.dynamic.push((std::ptr::from_ref(heap) as usize, host.id(), first, n));
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
@@ -3070,6 +3099,29 @@ fn is_root_view(u: &victory_shader::emit::UserData) -> bool {
     u.root == RootType::Descriptor && u.dword >= victory_shader::emit::ROOT_SRV_VIEW
 }
 
+/// Whether a non-descriptor root argument's dword 4 is user data rather than
+/// a root view's offset (`VICTORY_ROOT_CONSTANT_DWORD4=0` restores the old
+/// behaviour, which dropped GTA VI's post-processing shaders reading a fifth
+/// root constant). On by default: the translator's dword 4 is an offset only
+/// for a root descriptor.
+fn root_constant_dword4() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let on = !matches!(
+            std::env::var("VICTORY_ROOT_CONSTANT_DWORD4").as_deref(),
+            Ok("0")
+        );
+        tracing::info!(enabled = on, "root constant dword 4");
+        on
+    })
+}
+
+/// A user-data entry whose dword 4 takes a root view's offset: only a root
+/// descriptor's. Dword 4 of root constants is the fifth constant.
+fn is_root_view_offset(u: &victory_shader::emit::UserData) -> bool {
+    u.root == RootType::Descriptor && u.dword == victory_shader::emit::ROOT_VIEW_OFFSET
+}
+
 /// Whether a shader reads root views through views the host makes.
 fn has_root_views(t: &victory_shader::emit::HostShader) -> bool {
     t.user_data.iter().any(is_root_view)
@@ -3110,6 +3162,26 @@ mod tests {
     use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
     use windows::Win32::Graphics::Direct3D::ID3DBlob;
     use windows::core::s;
+
+    /// Dword 4 is a root descriptor's view offset; in root constants and
+    /// tables it is just user data. Reading a fifth root constant used to
+    /// drop the shader for want of a root view.
+    #[test]
+    fn only_root_descriptors_take_view_offsets() {
+        use victory_shader::emit::{ROOT_SRV_VIEW, ROOT_VIEW_OFFSET, UserData};
+        let entry = |root, dword| UserData {
+            index: 0,
+            slot: 8,
+            root,
+            dword,
+        };
+        assert!(is_root_view_offset(&entry(RootType::Descriptor, ROOT_VIEW_OFFSET)));
+        assert!(!is_root_view_offset(&entry(RootType::Constants, ROOT_VIEW_OFFSET)));
+        assert!(!is_root_view_offset(&entry(RootType::Table, ROOT_VIEW_OFFSET)));
+        assert!(!is_root_view_offset(&entry(RootType::Descriptor, ROOT_SRV_VIEW)));
+        assert!(is_root_view(&entry(RootType::Descriptor, ROOT_SRV_VIEW)));
+        assert!(!is_root_view(&entry(RootType::Constants, ROOT_VIEW_OFFSET)));
+    }
 
     /// Reads 16 dwords 64 bytes apart from `offset` past the root view
     /// (heap index in the table) as the translated shaders do: the root
