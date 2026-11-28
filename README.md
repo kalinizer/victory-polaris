@@ -17,38 +17,41 @@ getting the dump to run on a machine the upstream project does not target:
 Everything below comes from actually running the game on that machine. It is
 not a claim about other hardware.
 
-## Status (2026-11-28)
+## Status (2026-11-28, latest run)
 
-**Not playable yet, but the 3D world now draws instead of being solid black.**
-The user sees a blue sky/horizon, a dark blue ground and a small number of
-boxes where geometry should be; the pause menu is still a blurred gradient
-whose options can only be selected by sound. The remaining work is visible
-geometry and menu text, not getting the host to render at all.
+**Not playable, but much closer: characters now render, the sky and clouds are
+full color, the peak frame rate is ~3–4 fps (was ~1 fps), and there have been
+no OOM crashes in the last 18 cycles.** The ground and world geometry are
+still mostly black, and the pause menu is still a blurred gradient. The user's
+own screenshots on the live window are the source of the visual claims below;
+the dumps/captures show individual render targets, not a composited 3D frame.
 
-| Stage | Observed on this machine |
+| Stage | Observed on this machine (latest) |
 |---|---|
 | Boot, first-boot screens, profile/save | works (needs scripted keys, see below) |
 | Intro cinematic audio, sound, music, ambience | works |
-| 2D presentation planes (splash, loading art) | full color (were solid black before the compositor fix) |
-| 3D world | **partly renders**: sky and ground visible, most geometry missing (was entirely black) |
-| Menus / HUD text | blurred gradient; navigation works by sound |
-| World geometry submitted | up to ~2,700 draws/frame at gameplay, emulated mesh pipelines active |
-| Indirect mesh draws | ~4,000/frame were dropped by the per-frame budget before it was raised to 4096; the budget and bounded root-view sink pool are what keep the scene-load from OOM-ing |
-| Live gameplay | reached frame ~30,000+, ~1 fps (~1,000 ms/frame) — slow but stable in the best runs |
-| Memory | **stable in the surviving runs**: shadow windows 56/256, ~770 MiB shadow total; peak working set ~9–10 GB on 16 GB RAM. The 1 MiB root-view sinks, unlimited root-view refresh and mip-heavy host textures were the three OOM classes |
+| 2D presentation planes (splash, loading art, cutscenes) | full color, including a boat cutscene with a character |
+| 3D world | character models render (dark silhouettes against the sky), full-color clouds/skies; **ground and buildings still black** |
+| Menus / HUD text | still a blurred gradient with no text; navigation works by sound. Saved screen size was 3840×2160 on a 1920×1080 display; `VICTORY_UI_RESOLUTION=1920x1080` patches the user-data `settings.xml` but triggers a suspend/resume that ends the title — it is off by default now |
+| World geometry submitted | 600–1,000 draws/frame at gameplay (up to ~5,600 in earlier runs); emulated mesh pipelines active |
+| Indirect mesh draws | the per-frame budget (4096) and bounded sink pool eliminated the ~4,000 dropped draws/frame; the remaining skips are 11–12 per frame |
+| Frame rate | **~2–4 fps**, peak ~4 fps — a real improvement from ~1 fps |
+| Memory | 13.3–14.0 GB RAM used (84–89% of 16 GB), 7.3–7.4 GB GPU memory, dedicated 4.2–4.3/8.0 GB; no OOM in the last 18 cycles. Earlier OOM classes (1 MiB root-view sinks, unlimited refresh, mip-heavy textures) are fixed |
+| Root-view pressure | buffer copies refused by the card-budget **0** (was ~4,700/frame); outside-buffer root views 1,141 (was ~8,600); windows refused 3,245 (was ~33,800); null raw views 256/frame (was 2,048); loose windows at the 256 ceiling. The remaining black ground now looks like missing indirect light rather than missing geometry |
 
-> The full frame captures in `polaris-loop-a/frame-30000-*.png` are individual
-> render targets (sky/fog planes), **not** a composited screenshot of the 3D
-> world. A large, non-black PNG proves that *something* was presented; it does
-> not prove that the world shaders are right. ongoing verification uses the
-> live window and the diagnostic counters in the frame-rate line.
+Latest diagnostic counters from the gameplay window:
 
-Translation counts from the diagnostic run:
+- `root-constant dword 4s/frame` — the RX 580 fix is active; 11 post-process
+  shaders that were being dropped every frame now get their constants.
+- barycentric capability probe — added, log-only; tells us whether
+  `BarycentricsSupported=false` explains any remaining PSO refusals.
+- `shader does not translate` — down to a handful of compute/pixel programs with
+  lane-mask/barycentric gaps; the barycentric live-join fix (`VICTORY_JOIN_FIX`)
+  targets hash `98bd9f9ae5f9c7e3`.
 
-- `shader does not translate`: **14** (hundreds/thousands before the shader fixes)
-- `shader translated`: **2,511**
-- These errors are real and were reduced, but clearing them did **not** by
-  itself restore the 3D world.
+Run with 60-minute cycles (`E:\gtaxbox-tools\autoloop.ps1`) because the title
+takes ~20–35 minutes of scripted keys to get through the intro/cutscenes to
+gameplay; 25-minute runs were cut off before reaching it.
 
 ## Why this fork exists
 
