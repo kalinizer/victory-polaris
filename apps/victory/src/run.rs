@@ -4,6 +4,49 @@ use anyhow::{Context, Result};
 
 use crate::{Console, Unimplemented};
 
+/// One-time startup echo of the effective, consumed presentation switches.
+/// Bounded allowlist: no secret names, no path-valued keys (`VICTORY_CAPTURE`
+/// is deliberately absent), and values that look like a path are redacted.
+#[cfg(windows)]
+fn echo_config() {
+    static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if ONCE.set(()).is_err() {
+        return;
+    }
+    const KEYS: &[(&str, &str)] = &[
+        ("VICTORY_UI_DOWNSAMPLE", "level"),
+        ("VICTORY_UI_ALPHA", "premul"),
+        ("VICTORY_UI_ALPHA_HIST", "0"),
+        ("VICTORY_UI_RESOLUTION", "<unset>"),
+        ("VICTORY_LOG_WRITERS", "0"),
+        ("VICTORY_DUMP_INTERFACE_ONLY", "0"),
+        ("VICTORY_PRESENT_SHADER_COMBINE", "0"),
+        ("VICTORY_PRESENT_ALL_RESOURCES", "0"),
+        ("VICTORY_PRESENT_BASE_SIZE", "on"),
+        ("VICTORY_RENDER_SCALE", "1"),
+        ("VICTORY_LOG_PLANES", "0"),
+        ("VICTORY_DUMP_TARGETS", "0"),
+        ("VICTORY_DUMP_WRITERS", "<unset>"),
+    ];
+    let mut shown = 0;
+    for &(key, default) in KEYS {
+        let value = std::env::var(key)
+            .ok()
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| default.to_owned());
+        let safe = value.len() <= 64
+            && !value.chars().any(|c| c == '\\' || c == '/' || c.is_control());
+        println!(
+            "[config] accepted {key}={}",
+            if safe { value.as_str() } else { "<redacted>" }
+        );
+        shown += 1;
+        if shown == 16 {
+            break;
+        }
+    }
+}
+
 #[cfg(any(windows, test))]
 const SKIP_CPU_CHECK_ENV: &str = "VICTORY_SKIP_CPU_CHECK";
 
@@ -155,7 +198,13 @@ fn apply_ui_resolution(storage: &Path, action: UiResolution) {
                 SavedResolution::Changed(new, old_width, old_height) => {
                     (new, old_width, old_height)
                 }
-                SavedResolution::Already => return,
+                SavedResolution::Already => {
+                    static SAID: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                    if SAID.set(()).is_ok() {
+                        println!("ui resolution already {width}x{height}; no change");
+                    }
+                    return;
+                }
                 SavedResolution::Malformed => {
                     eprintln!(
                         "ui resolution: no <resolutionFullscreen> width/height in {}",
@@ -208,6 +257,7 @@ pub fn run(
     use victory_hle::{HleResolver, HostPolicy};
     use victory_loader::{BindReport, UnimplementedPolicy, WithTitleDlls};
 
+    echo_config();
     if execute {
         check_cpu_features()?;
     }

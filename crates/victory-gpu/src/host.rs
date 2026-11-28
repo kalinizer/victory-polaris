@@ -2866,6 +2866,75 @@ fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
 const BUFFERS: u32 = 2;
 const MAX_PLANES: u32 = 8;
 
+/// Effective presentation A/B settings, read once. Both default to the
+/// current (HEAD) behaviour: one mip-0 bilinear tap and premultiplied alpha.
+/// Nothing here changes plane discovery, swap sizing or the title's targets.
+struct UiConfig {
+    downsample: &'static str,
+    taps: u32,
+    box4: bool,
+    alpha: &'static str,
+    straight: bool,
+}
+
+fn ui_config() -> &'static UiConfig {
+    static CONFIG: OnceLock<UiConfig> = OnceLock::new();
+    CONFIG.get_or_init(|| {
+        let (downsample, taps, box4) = match std::env::var("VICTORY_UI_DOWNSAMPLE").as_deref() {
+            Ok("box4") => ("box4", 4, true),
+            _ => ("level", 1, false),
+        };
+        let (alpha, straight) = match std::env::var("VICTORY_UI_ALPHA").as_deref() {
+            Ok("straight") => ("straight", true),
+            _ => ("premul", false),
+        };
+        tracing::info!("[ui] downsample={downsample} taps={taps}");
+        tracing::info!("[ui] alpha_mode={alpha}");
+        UiConfig { downsample, taps, box4, alpha, straight }
+    })
+}
+
+/// Four additional bilinear taps at +/- half a source texel. Averaging them
+/// widens the footprint to the 4x4 neighborhood a 2x downsample actually
+/// covers, so one-pixel glyph strokes survive. `GetDimensions` keeps the
+/// offsets correct for any interface-plane size; mip 0 and the clamp sampler
+/// are unchanged from the default path.
+const BOX4: &str = r#"
+            float4 box4(Texture2D t, SamplerState s, float2 uv) {
+                uint w, h;
+                t.GetDimensions(w, h);
+                float2 o = 0.5 / float2(w, h);
+                return (t.SampleLevel(s, uv + float2(-o.x, -o.y), 0)
+                      + t.SampleLevel(s, uv + float2( o.x, -o.y), 0)
+                      + t.SampleLevel(s, uv + float2(-o.x,  o.y), 0)
+                      + t.SampleLevel(s, uv + float2( o.x,  o.y), 0)) * 0.25;
+            }
+"#;
+
+/// The overlay plane's pixel shader when `VICTORY_UI_DOWNSAMPLE=box4`. The
+/// opaque base plane keeps `SOURCE` unchanged: it is normally 1:1 and box
+/// filtering it would blur the scene.
+const OVERLAY_BOX4_SOURCE: &str = r#"
+            Texture2D tex : register(t0);
+            SamplerState smp : register(s0);
+            float4 box4(Texture2D t, SamplerState s, float2 uv) {
+                uint w, h;
+                t.GetDimensions(w, h);
+                float2 o = 0.5 / float2(w, h);
+                return (t.SampleLevel(s, uv + float2(-o.x, -o.y), 0)
+                      + t.SampleLevel(s, uv + float2( o.x, -o.y), 0)
+                      + t.SampleLevel(s, uv + float2(-o.x,  o.y), 0)
+                      + t.SampleLevel(s, uv + float2( o.x,  o.y), 0)) * 0.25;
+            }
+            void vs(uint id : SV_VertexID, out float4 pos : SV_Position, out float2 uv : TEXCOORD) {
+                uv = float2((id << 1) & 2, id & 2);
+                pos = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+            }
+            float4 ps(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
+                return box4(tex, smp, uv);
+            }
+"#;
+
 /// Built-in fullscreen-triangle compositor for multi-plane `PresentX` calls
 /// (e.g. Series S presenting a 1080p scene plane with a 4K UI overlay plane).
 struct Compositor {
@@ -2914,6 +2983,67 @@ impl Compositor {
                 return float4(saturate(o.rgb + s.rgb * (1 - saturate(o.a))), 1);
             }
         "#;
+        // The non-default combine variants are assembled from the same
+        // declarations and VS. Only the interface texture's sampling and the
+        // alpha equation change; the scene plane stays a single mip-0 tap.
+        const COMBINE_HEAD: &str = r#"
+            Texture2D scene : register(t0);
+            Texture2D over : register(t1);
+            SamplerState smp : register(s0);
+        "#;
+        const COMBINE_VS: &str = r#"
+            void vs(uint id : SV_VertexID, out float4 pos : SV_Position, out float2 uv : TEXCOORD) {
+                uv = float2((id << 1) & 2, id & 2);
+                pos = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+            }
+        "#;
+        const PS_LEVEL_PREMUL: &str = r#"
+            float4 ps(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
+                float4 s = scene.SampleLevel(smp, uv, 0);
+                float4 o = over.SampleLevel(smp, uv, 0);
+                return float4(saturate(o.rgb + s.rgb * (1 - saturate(o.a))), 1);
+            }
+        "#;
+        const PS_BOX4_PREMUL: &str = r#"
+            float4 ps(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
+                float4 s = scene.SampleLevel(smp, uv, 0);
+                float4 o = box4(over, smp, uv);
+                return float4(saturate(o.rgb + s.rgb * (1 - saturate(o.a))), 1);
+            }
+        "#;
+        const PS_LEVEL_STRAIGHT: &str = r#"
+            float4 ps(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
+                float4 s = scene.SampleLevel(smp, uv, 0);
+                float4 o = over.SampleLevel(smp, uv, 0);
+                return float4(saturate(o.rgb * saturate(o.a) + s.rgb * (1 - saturate(o.a))), 1);
+            }
+        "#;
+        const PS_BOX4_STRAIGHT: &str = r#"
+            float4 ps(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
+                float4 s = scene.SampleLevel(smp, uv, 0);
+                float4 o = box4(over, smp, uv);
+                return float4(saturate(o.rgb * saturate(o.a) + s.rgb * (1 - saturate(o.a))), 1);
+            }
+        "#;
+        let config = ui_config();
+        // Both switches unset takes the exact HEAD source. The overlay has
+        // its own PS so the opaque scene plane never receives the box filter.
+        let combine_source = if !config.box4 && !config.straight {
+            COMBINE_SOURCE.to_owned()
+        } else {
+            let mut source = String::from(COMBINE_HEAD);
+            if config.box4 {
+                source.push_str(BOX4);
+            }
+            source.push_str(COMBINE_VS);
+            source.push_str(match (config.box4, config.straight) {
+                (false, false) => PS_LEVEL_PREMUL,
+                (true, false) => PS_BOX4_PREMUL,
+                (false, true) => PS_LEVEL_STRAIGHT,
+                (true, true) => PS_BOX4_STRAIGHT,
+            });
+            source
+        };
         let compile = |source: &str, entry: PCSTR, target: PCSTR| -> windows::core::Result<ID3DBlob> {
             let mut code: Option<ID3DBlob> = None;
             let mut errors: Option<ID3DBlob> = None;
@@ -2950,13 +3080,22 @@ impl Compositor {
         };
         let vs = compile(SOURCE, s!("vs"), s!("vs_5_1"))?;
         let ps = compile(SOURCE, s!("ps"), s!("ps_5_1"))?;
-        let ps_combine = compile(COMBINE_SOURCE, s!("ps"), s!("ps_5_1"))?;
+        let ps_overlay = compile(
+            if config.box4 { OVERLAY_BOX4_SOURCE } else { SOURCE },
+            s!("ps"),
+            s!("ps_5_1"),
+        )?;
+        let ps_combine = compile(&combine_source, s!("ps"), s!("ps_5_1"))?;
         // SAFETY: compiled shader blobs live through PSO creation.
         unsafe {
             let vs_bytes =
                 std::slice::from_raw_parts(vs.GetBufferPointer().cast::<u8>(), vs.GetBufferSize());
             let ps_bytes =
                 std::slice::from_raw_parts(ps.GetBufferPointer().cast::<u8>(), ps.GetBufferSize());
+            let ps_overlay_bytes = std::slice::from_raw_parts(
+                ps_overlay.GetBufferPointer().cast::<u8>(),
+                ps_overlay.GetBufferSize(),
+            );
             let ps_combine_bytes = std::slice::from_raw_parts(
                 ps_combine.GetBufferPointer().cast::<u8>(),
                 ps_combine.GetBufferSize(),
@@ -3017,7 +3156,14 @@ impl Compositor {
                 };
                 if blend {
                     rt_blend.BlendEnable = true.into();
-                    rt_blend.SrcBlend = D3D12_BLEND_ONE;
+                    // `premul` (default) keeps HEAD's ONE/INV_SRC_ALPHA.
+                    // `straight` multiplies the source colour by its alpha
+                    // in the blend instead; the scene/swap are untouched.
+                    rt_blend.SrcBlend = if config.straight {
+                        D3D12_BLEND_SRC_ALPHA
+                    } else {
+                        D3D12_BLEND_ONE
+                    };
                     rt_blend.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
                     rt_blend.BlendOp = D3D12_BLEND_OP_ADD;
                     rt_blend.SrcBlendAlpha = D3D12_BLEND_ONE;
@@ -3060,7 +3206,7 @@ impl Compositor {
                 pso
             };
             let opaque = make_pso(ps_bytes, false)?;
-            let overlay = make_pso(ps_bytes, true)?;
+            let overlay = make_pso(ps_overlay_bytes, true)?;
             let combine = make_pso(ps_combine_bytes, false)?;
             let rtv_heap: ID3D12DescriptorHeap =
                 device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
@@ -3467,6 +3613,8 @@ impl Host {
             };
             p.copy.reset();
             let list = &p.copy.list;
+            #[cfg(feature = "diagnostics")]
+            let mut alpha_readback: Option<ID3D12Resource> = None;
             let (capture, probe) = if planes.len() == 1 && scale == 1.0 {
                 let (texture, state) = planes[0];
                 let state = D3D12_RESOURCE_STATES(state as i32);
@@ -3652,6 +3800,33 @@ impl Host {
                         list.DrawInstanced(3, 1, 0, 0);
                     }
                 }
+                // Opt-in, image-free interface alpha histogram. The interface
+                // plane is plane 1; it is a PS resource after the draws, so
+                // bracket the grid copies with COPY_SOURCE transitions and
+                // leave it as it was for the `after` barriers below.
+                #[cfg(feature = "diagnostics")]
+                if crate::switch::on("VICTORY_UI_ALPHA_HIST")
+                    && crate::capture::wanted(frame)
+                    && count >= 2
+                {
+                    let (interface, _) = planes[1];
+                    let d = interface.GetDesc();
+                    if d.SampleDesc.Count == 1
+                        && d.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER
+                    {
+                        list.ResourceBarrier(&[transition(
+                            interface,
+                            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                            D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        )]);
+                        alpha_readback = crate::capture::alpha_probe(&self.device, list, interface);
+                        list.ResourceBarrier(&[transition(
+                            interface,
+                            D3D12_RESOURCE_STATE_COPY_SOURCE,
+                            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                        )]);
+                    }
+                }
                 #[cfg(feature = "diagnostics")]
                 let (capture, probe) = {
                     list.ResourceBarrier(&[transition(
@@ -3687,6 +3862,10 @@ impl Host {
             };
             p.copy.close();
             self.execute(&[&p.copy]);
+            #[cfg(feature = "diagnostics")]
+            if let Some(buffer) = alpha_readback {
+                crate::capture::alpha_histogram(&buffer);
+            }
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
                 // Tests inspect the completed copy before flip-discard Present

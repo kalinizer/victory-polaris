@@ -132,16 +132,20 @@ impl Shader {
                         kernel_ms,
                         "shader translated"
                     ),
-                    Err(e) => tracing::warn!(
-                        stage = self.stage,
-                        hash = %self.hash,
-                        error = %e,
-                        cached,
-                        ms,
-                        user_ms,
-                        kernel_ms,
-                        "shader does not translate; its pipelines' draws are dropped"
-                    ),
+                    Err(e) => {
+                        tracing::warn!(
+                            stage = self.stage,
+                            hash = %self.hash,
+                            error = %e,
+                            cached,
+                            ms,
+                            user_ms,
+                            kernel_ms,
+                            "shader does not translate; its pipelines' draws are dropped"
+                        );
+                        // Default-off: no-op unless VICTORY_SHADER_DIAG is set.
+                        crate::pipeline::host::shader_diag::note_refusal(&e);
+                    }
                 }
                 done.ok()
             })

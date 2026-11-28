@@ -31,9 +31,10 @@
 //!
 //! With `VICTORY_LIGHT_FORMAT_FLOAT=1` the light image is hosted as
 //! R16G16B16A16_FLOAT rather than R9G9B9E5 packed in R32_UINT. The `raise`
-//! program then stores float3 light directly ([`crate::resource::
-//! light_float_format`]); without the switch it keeps packing the shared
-//! exponent, byte for byte as before.
+//! program then stores float3 light directly; without the switch it keeps
+//! packing the shared exponent, byte for byte as before. The one decision is
+//! [`crate::resource::light_effective_format`], shared by resource creation,
+//! views, clears, copies and the Resolve format gate.
 
 use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -83,12 +84,14 @@ pub(crate) const AIR: (u8, u32) = (1, 32);
 /// (42) with packed R9G9B9E5 normally, RGBA16F (10) under
 /// `VICTORY_LIGHT_FORMAT_FLOAT=1`.
 pub(crate) fn light_format() -> u32 {
-    if crate::resource::light_float_format() { 10 } else { 42 }
+    crate::resource::light_effective_format()
 }
 
 /// Whether a resolve light image has the format our `raise` writes. Use
 /// this at the dispatch check so the float program is only dispatched at
-/// an image that can hold floats. `draw.rs`'s dispatch gate lives with the
+/// an image that can hold floats. It reads [`light_format`], the same cached
+/// decision as resource creation, views and clears, so a UINT image under
+/// the float mode is refused. `draw.rs`'s dispatch gate lives with the
 /// other host-side changes; this predicate is kept here next to the
 /// program that needs it.
 #[allow(dead_code)]
@@ -452,6 +455,9 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
     let place = pipeline("PLACE", s!("place"))?;
     let gather = pipeline("GATHER", s!("gather"))?;
     let raise = pipeline("RAISE", s!("raise"))?;
+    // Build the float variant only when the one format decision says so
+    // (`light_float_format` is a view of it); `after` selects with the same
+    // `light_format()` predicate.
     let raise_float = if crate::resource::light_float_format() {
         Some(pipeline("RAISE\n#define FLOAT_LIGHT", s!("raise"))?)
     } else {
@@ -602,6 +608,13 @@ mod tests {
         assert!(!crate::resource::light_float_format());
         assert!(light_format_ok(42));
         assert!(!light_format_ok(10));
+    }
+
+    #[test]
+    fn light_gate_accepts_exactly_the_effective_format() {
+        assert_eq!(light_format(), crate::resource::light_effective_format());
+        assert!(light_format_ok(light_format()));
+        assert!(!light_format_ok(light_format() + 1));
     }
 
     #[test]

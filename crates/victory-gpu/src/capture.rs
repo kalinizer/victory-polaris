@@ -3,16 +3,98 @@
 //! two (the frames the log reports) is saved as `frame-<n>.png`, at half
 //! size. Only in builds with diagnostics.
 
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
+use std::sync::OnceLock;
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
-/// The folder frames go to, if capturing.
+/// Marker at the root of a source tree, as in `victory-core`'s policy.
+const ROOT_MARKER: &str = ".victory-root";
+/// One texture readback, not the sum of a frame's dumps. A 3840x2160 8-bit
+/// color plane is about 32 MiB, so this still permits the interface plane.
+const DUMP_BYTE_CAP: u64 = 64 << 20;
+
+/// Canonicalizes the longest existing prefix and re-appends the rest, so a
+/// folder that does not exist yet can still be compared with a source tree.
+fn resolve_existing(path: &Path) -> Result<PathBuf, std::io::Error> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut existing = absolute.as_path();
+    let mut rest: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        match std::fs::canonicalize(existing) {
+            Ok(canon) => {
+                let mut out = canon;
+                for name in rest.iter().rev() {
+                    out.push(name);
+                }
+                return Ok(normalize(out));
+            }
+            Err(source) => match (existing.parent(), existing.file_name()) {
+                (Some(parent), Some(name)) => {
+                    rest.push(name.to_os_string());
+                    existing = parent;
+                }
+                (Some(parent), None) if existing.ends_with("..") => {
+                    rest.push("..".into());
+                    existing = parent;
+                }
+                _ => return Err(source),
+            },
+        }
+    }
+}
+
+fn normalize(path: PathBuf) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            component => out.push(component),
+        }
+    }
+    out
+}
+
+/// Local mirror of `victory_core::policy::ensure_outside_repo` (the helper is
+/// not reachable from this crate until `victory-core` is a dependency; see
+/// the integrator hook patch in the wave report). Refuses on any resolution
+/// error as well as on a path inside a marked source tree.
+fn outside_repo(path: &Path) -> bool {
+    let Ok(resolved) = resolve_existing(path) else { return false };
+    let compiled = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    if let Ok(root) = std::fs::canonicalize(compiled)
+        && root.join(ROOT_MARKER).is_file()
+        && resolved.starts_with(&root)
+    {
+        return false;
+    }
+    !resolved.ancestors().any(|a| a.join(ROOT_MARKER).is_file())
+}
+
+/// The folder frames go to, if capturing. The configured path is validated
+/// once, before any directory is created, so a relative path cannot write
+/// game-derived data into a source tree.
 pub(crate) fn folder() -> Option<&'static PathBuf> {
-    static FOLDER: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    static FOLDER: OnceLock<Option<PathBuf>> = OnceLock::new();
     FOLDER
-        .get_or_init(|| std::env::var_os("VICTORY_CAPTURE").map(PathBuf::from))
+        .get_or_init(|| {
+            let path = PathBuf::from(std::env::var_os("VICTORY_CAPTURE")?);
+            if !outside_repo(&path) {
+                tracing::warn!(
+                    "VICTORY_CAPTURE refused: destination is inside a source tree; nothing will be written"
+                );
+                return None;
+            }
+            Some(path)
+        })
         .as_ref()
 }
 
@@ -250,11 +332,80 @@ pub(crate) fn binding(pipeline: &str) {
     if dump_on() {
         WRITER.with(|w| pipeline.clone_into(&mut w.borrow_mut()));
     }
+    if log_writers() && !pipeline.is_empty() {
+        writer_row(
+            crate::draw::drawn(),
+            stage_hash(pipeline, "vertex"),
+            stage_hash(pipeline, "pixel"),
+            "-",
+            "-",
+            "-",
+            false,
+        );
+    }
 }
 
 pub(crate) fn dump_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| folder().is_some() && crate::switch::on("VICTORY_DUMP_TARGETS"))
+}
+
+/// `VICTORY_DUMP_INTERFACE_ONLY=1` scopes writer dumps to the interface
+/// plane. Off by default, so HEAD's first-use dump order is unchanged.
+fn interface_only() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_DUMP_INTERFACE_ONLY"))
+}
+
+fn is_interface(d: &D3D12_RESOURCE_DESC) -> bool {
+    d.Width == 3840 && d.Height == 2160
+}
+
+/// `VICTORY_LOG_WRITERS=1` emits log-only rows and never writes an image.
+pub(crate) fn log_writers() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_LOG_WRITERS"))
+}
+
+/// Pulls vertex/pixel hashes out of `pipeline::shaders_of` (`"[vertex <hash>,
+/// pixel <hash>]"`). The hook patch in the report can pass exact stage hashes.
+fn stage_hash<'a>(name: &'a str, stage: &str) -> &'a str {
+    let mut words = name.split_whitespace();
+    while let Some(word) = words.next() {
+        let bare = word.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+        if bare == stage {
+            return words
+                .next()
+                .unwrap_or("-")
+                .trim_matches(|c: char| !c.is_ascii_alphanumeric());
+        }
+    }
+    "-"
+}
+
+/// One row per distinct pipeline, at most 64 per process. `blend`, `srvs`,
+/// `viewport` and `refused` are filled by the draw-site hook patch; at the
+/// pipeline bind only the hashes and draw index are available.
+pub(crate) fn writer_row(
+    draw: u64,
+    vs: &str,
+    ps: &str,
+    blend: &str,
+    srvs: &str,
+    viewport: &str,
+    refused: bool,
+) {
+    static SHOWN: OnceLock<std::sync::Mutex<Vec<String>>> = OnceLock::new();
+    let key = format!("{vs}/{ps}");
+    let mut shown = SHOWN
+        .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if shown.len() >= 64 || shown.iter().any(|s| *s == key) {
+        return;
+    }
+    shown.push(key);
+    tracing::info!(draw, vs, ps, blend, srvs, viewport, refused, "writer row");
 }
 
 /// `VICTORY_DUMP_WRITERS`' hashes not dumped yet.
@@ -344,6 +495,7 @@ pub(crate) fn dump_targets(frame: u64) {
         );
     }
     let Some(host) = crate::host::host() else { return };
+    let mut skipped = 0;
     for (i, (resource, copy, by)) in targets.iter().enumerate() {
         let texture = &copy.texture;
         // SAFETY: a live resource.
@@ -351,10 +503,17 @@ pub(crate) fn dump_targets(frame: u64) {
         if d.SampleDesc.Count > 1 || d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER {
             continue;
         }
+        if interface_only() && !is_interface(&d) {
+            skipped += 1;
+            continue;
+        }
         // Every submission has run; the dump's list moves it there and back.
         let state = copy.state.load(Relaxed);
         let target = (i, *resource as crate::object::This, by.as_str());
         dump_one(host, texture, state, &format!("frame-{frame}"), target, &d);
+    }
+    if skipped > 0 {
+        tracing::info!(skipped, "writer dumps scoped to the interface plane");
     }
 }
 
@@ -366,6 +525,7 @@ pub(crate) fn dump_submission(sub: u64, targets: &[(usize, String)]) {
     let Some(host) = crate::host::host() else { return };
     let frame = crate::queue::presented() + 1;
     peek(&format!("frame-{frame}-s{sub:04}"));
+    let mut skipped = 0;
     for (i, (resource, by)) in targets.iter().enumerate() {
         let Some(copy) = crate::resource::host_copy(*resource as crate::object::This) else {
             continue;
@@ -374,6 +534,10 @@ pub(crate) fn dump_submission(sub: u64, targets: &[(usize, String)]) {
         // SAFETY: a live resource.
         let d = unsafe { texture.GetDesc() };
         if d.SampleDesc.Count > 1 || d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER {
+            continue;
+        }
+        if interface_only() && !is_interface(&d) {
+            skipped += 1;
             continue;
         }
         let state = copy.state.load(Relaxed);
@@ -388,6 +552,9 @@ pub(crate) fn dump_submission(sub: u64, targets: &[(usize, String)]) {
             let target = (i, *resource as crate::object::This, by.as_str());
             dump_one(host, &plane.texture, plane.state.load(Relaxed), &format!("frame-{frame}-s{sub:04}"), target, &pd);
         }
+    }
+    if skipped > 0 {
+        tracing::info!(sub, skipped, "submission writer dumps scoped to the interface plane");
     }
 }
 
@@ -520,6 +687,17 @@ pub(crate) fn read_indirect(
     }
 }
 
+/// Bounded refusal log: one line for the first dump over the byte cap.
+fn refuse_dump(width: u64, height: u64, bytes: u64) {
+    static ONCE: OnceLock<()> = OnceLock::new();
+    if ONCE.set(()).is_ok() {
+        tracing::warn!(
+            width, height, bytes, cap = DUMP_BYTE_CAP,
+            "target dump refused: byte cap"
+        );
+    }
+}
+
 fn dump_one(
     host: &crate::host::Host,
     texture: &ID3D12Resource,
@@ -528,6 +706,16 @@ fn dump_one(
     (i, resource, by): (usize, crate::object::This, &str),
     d: &D3D12_RESOURCE_DESC,
 ) {
+    // Refuse before the copy/readback and before any file is created: a
+    // buffer snapshot has a 64 MiB cap (:291), textures did not.
+    let bytes = crate::resource::element(d.Format.0 as u32)
+        .map_or(4, |(b, _)| b)
+        .saturating_mul(d.Width)
+        .saturating_mul(u64::from(d.Height));
+    if bytes > DUMP_BYTE_CAP {
+        refuse_dump(d.Width, u64::from(d.Height), bytes);
+        return;
+    }
     let Ok(list) = host.new_list() else { return };
     let state = D3D12_RESOURCE_STATES(crate::host::legal_state(texture, state) as i32);
     let copy = D3D12_RESOURCE_STATE_COPY_SOURCE;
@@ -836,6 +1024,140 @@ static LEVELS: std::sync::Mutex<std::collections::VecDeque<u8>> =
 pub(crate) fn recent_levels() -> Vec<u8> {
     let levels = LEVELS.lock().unwrap_or_else(|e| e.into_inner());
     levels.iter().copied().collect()
+}
+
+/// Samples per side of the alpha histogram: 256 one-pixel copies, ~128 KiB
+/// of readback, no PNG.
+const A_GRID: u32 = 16;
+
+/// `VICTORY_UI_ALPHA_HIST`: records a grid of single pixels of the interface
+/// plane (8-bit color formats only, byte 3 is alpha; X8 formats read no
+/// meaningful alpha and are skipped), reusing `probe`'s placement pattern.
+pub(crate) fn alpha_probe(
+    device: &ID3D12Device,
+    list: &ID3D12GraphicsCommandList,
+    texture: &ID3D12Resource,
+) -> Option<ID3D12Resource> {
+    // SAFETY: a live resource.
+    let d = unsafe { texture.GetDesc() };
+    if !matches!(d.Format.0, 27..=32 | 87 | 90 | 91)
+        || d.Width < u64::from(A_GRID)
+        || d.Height < A_GRID
+    {
+        return None;
+    }
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: SLOT * u64::from(A_GRID * A_GRID),
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        ..Default::default()
+    };
+    let heap = D3D12_HEAP_PROPERTIES {
+        Type: D3D12_HEAP_TYPE_READBACK,
+        ..Default::default()
+    };
+    let mut buffer: Option<ID3D12Resource> = None;
+    // SAFETY: plain creation; an open list; locations naming live resources.
+    unsafe {
+        device
+            .CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                None,
+                &mut buffer,
+            )
+            .ok()?;
+        let buffer = buffer?;
+        for i in 0..A_GRID * A_GRID {
+            let (x, y) = (
+                (2 * (i % A_GRID) + 1) * d.Width as u32 / (2 * A_GRID),
+                (2 * (i / A_GRID) + 1) * d.Height / (2 * A_GRID),
+            );
+            let to = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&buffer),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Offset: SLOT * u64::from(i),
+                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                            Format: d.Format,
+                            Width: 1,
+                            Height: 1,
+                            Depth: 1,
+                            RowPitch: 256,
+                        },
+                    },
+                },
+            };
+            let from = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(texture),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    SubresourceIndex: 0,
+                },
+            };
+            let pixel = D3D12_BOX {
+                left: x,
+                top: y,
+                front: 0,
+                right: x + 1,
+                bottom: y + 1,
+                back: 1,
+            };
+            list.CopyTextureRegion(&to, 0, 0, 0, &from, Some(&pixel));
+        }
+        Some(buffer)
+    }
+}
+
+/// Logs an image-free alpha histogram of [`alpha_probe`]'s samples. A text
+/// candidate is a partially covered pixel (8 < a < 248) whose luminance is
+/// at least 24 away from the grid's mean, i.e. an edge rather than a wash.
+pub(crate) fn alpha_histogram(buffer: &ID3D12Resource) {
+    let mut data = std::ptr::null_mut();
+    // SAFETY: the copies finished (every submission is waited for).
+    unsafe {
+        if buffer.Map(0, None, Some(&mut data)).is_err() {
+            return;
+        }
+        let len = (SLOT * u64::from(A_GRID * A_GRID)) as usize;
+        let bytes = std::slice::from_raw_parts(data.cast::<u8>(), len);
+        let mut pixels: Vec<(u8, u8)> = Vec::with_capacity((A_GRID * A_GRID) as usize);
+        let mut min = 255u8;
+        let mut max = 0u8;
+        let mut sum = 0u64;
+        let mut luma_sum = 0u64;
+        for slot in bytes.chunks_exact(SLOT as usize) {
+            let p = &slot[..4];
+            let (r, g, b, a) = (u32::from(p[0]), u32::from(p[1]), u32::from(p[2]), p[3]);
+            min = min.min(a);
+            max = max.max(a);
+            sum += u64::from(a);
+            let luma = ((r * 299 + g * 587 + b * 114) / 1000) as u8;
+            luma_sum += u64::from(luma);
+            pixels.push((a, luma));
+        }
+        buffer.Unmap(0, None);
+        let n = pixels.len().max(1) as f64;
+        let mean = sum as f64 / n;
+        let mean_luma = luma_sum as f64 / n;
+        let candidates = pixels
+            .iter()
+            .filter(|(a, l)| *a > 8 && *a < 248 && ((f64::from(*l) - mean_luma).abs() >= 24.0))
+            .count();
+        tracing::info!(
+            "[ui] interface_alpha min={min} max={max} mean={mean:.1} text_candidate_pixels={candidates}"
+        );
+    }
 }
 
 #[cfg(test)]

@@ -398,7 +398,14 @@ fn sink_pool(frame: u64) -> std::sync::MutexGuard<'static, SinkPool> {
 
 /// Counts a null-view fallback, warning once per power of two rather than
 /// once per root view.
-fn null_sink(frame: u64, address: u64, bytes: u64) {
+fn null_sink(frame: u64, address: u64, bytes: u64, cause: crate::shadow::NullCause) {
+    // A shadow refusal names its own reason when there was one; otherwise
+    // use the sink's. Neither is inferred from the warning below.
+    let cause = match crate::shadow::take_null_cause() {
+        crate::shadow::NullCause::Other => cause,
+        known => known,
+    };
+    crate::shadow::note_null_view(cause);
     let n = SINKS_NULLED.fetch_add(1, Ordering::Relaxed) + 1;
     if n.is_power_of_two() {
         tracing::warn!(
@@ -419,7 +426,8 @@ fn null_sink(frame: u64, address: u64, bytes: u64) {
 fn sink(frame: u64, address: u64, bytes: u64) -> Option<SinkView> {
     let cap = sink_cap_bytes();
     if cap == 0 {
-        null_sink(frame, address, bytes);
+        // An explicit VICTORY_ROOT_VIEW_SINK_MB=0 disables the pool.
+        null_sink(frame, address, bytes, crate::shadow::NullCause::Other);
         return None;
     }
     let mut pool = sink_pool(frame);
@@ -433,7 +441,7 @@ fn sink(frame: u64, address: u64, bytes: u64) -> Option<SinkView> {
     }
     if pool.sinks.len() >= MAX_SINKS {
         drop(pool);
-        null_sink(frame, address, bytes);
+        null_sink(frame, address, bytes, crate::shadow::NullCause::WindowRefused);
         return None;
     }
     if crate::shadow::registered_loose() {
@@ -443,13 +451,13 @@ fn sink(frame: u64, address: u64, bytes: u64) -> Option<SinkView> {
         let offset = pool.sinks.len() as u64 * SINK_SLOT;
         if offset.saturating_add(bytes) > cap {
             drop(pool);
-            null_sink(frame, address, bytes);
+            null_sink(frame, address, bytes, crate::shadow::NullCause::ByteShort);
             return None;
         }
         if pool.arena.is_none() {
             let Some((buffer, data)) = crate::host::host().and_then(|h| h.shared_buffer(cap)) else {
                 drop(pool);
-                null_sink(frame, address, bytes);
+                null_sink(frame, address, bytes, crate::shadow::NullCause::Unmapped);
                 return None;
             };
             crate::host::name(&buffer, || format!("root-view sink arena {cap} bytes"));
@@ -472,7 +480,7 @@ fn sink(frame: u64, address: u64, bytes: u64) -> Option<SinkView> {
     // Baseline: one 1 MiB `shared_buffer` per sink, held by the entry.
     let Some((buffer, data)) = crate::host::host().and_then(|h| h.shared_buffer(bytes)) else {
         drop(pool);
-        null_sink(frame, address, bytes);
+        null_sink(frame, address, bytes, crate::shadow::NullCause::Unmapped);
         return None;
     };
     let view = SinkView {
@@ -1648,14 +1656,16 @@ impl State {
             once!(?role, "no ambient light: other tables");
             return false;
         };
-        // R32_UINT holding R9G9B9E5; R11G11B10_FLOAT.
-        let format = if role == Role::Resolve {
-            crate::ambient::light_format() as i32
+        // R32_UINT holding R9G9B9E5; R11G11B10_FLOAT. The Resolve gate asks
+        // the lighting predicate, so it accepts exactly the effective format
+        // the stand-in wrote; no second switch or local copy of the decision.
+        let format_ok = if role == Role::Resolve {
+            crate::ambient::light_format_ok(of.Format.0 as u32)
         } else {
-            26
+            of.Format.0 == 26
         };
         let volume = of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
-        if of.Format.0 != format
+        if !format_ok
             || (seen.Width, seen.Height) != (of.Width, of.Height)
             || volume != (role == Role::Air)
         {
@@ -3081,16 +3091,30 @@ fn root_view_fallback() -> bool {
 /// ~1000 root views a frame refresh to the end of its 1-2 MiB copy (~1.3 GB
 /// of CPU copies and ~57k page faults per frame in the crashed run), and the
 /// churn exhausted D3D12 memory with 0x8007000E. A positive value caps the
-/// refresh. `0` explicitly asks for unlimited (to the copy's end): risky on
-/// this workload — meshes whose vertex streams sit past the first MiB lose
-/// their bodies — but available for runs that need the reach.
+/// refresh. `0` / `unlimited` and values past the default + 512 MiB are refused
+/// with a warning and fall back to the 1 MiB default: there is no unlimited
+/// refresh path, so the reach can only be raised within that headroom.
 fn root_view_limit() -> u64 {
     static BYTES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *BYTES.get_or_init(|| {
-        std::env::var("VICTORY_ROOT_VIEW_MB")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(1 << 20, |n| if n == 0 { u64::MAX } else { n.saturating_mul(1 << 20) })
+        const DEFAULT_MB: u64 = 1;
+        const CEILING_MB: u64 = DEFAULT_MB + 512;
+        let raw = std::env::var("VICTORY_ROOT_VIEW_MB").ok();
+        let mb = match raw.as_deref().map(str::trim) {
+            None | Some("") => DEFAULT_MB,
+            Some(v) if v.eq_ignore_ascii_case("unlimited") || v.parse::<u64>() == Ok(0) => {
+                tracing::warn!(value = v, "VICTORY_ROOT_VIEW_MB=0/unlimited refused; unlimited refresh is not available; using the default");
+                DEFAULT_MB
+            }
+            Some(v) => match v.parse::<u64>() {
+                Ok(n) if n <= CEILING_MB => n,
+                _ => {
+                    tracing::warn!(value = v, ceiling_mb = CEILING_MB, "VICTORY_ROOT_VIEW_MB out of range; using the default");
+                    DEFAULT_MB
+                }
+            },
+        };
+        mb.saturating_mul(1 << 20)
     })
 }
 

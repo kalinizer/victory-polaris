@@ -554,8 +554,194 @@ fn dump_pso_dxil(kind: &str, shaders: &[Arc<Shader>], code: &[u8], root: &[u8]) 
     let _ = std::fs::File::create(stem.with_extension("root")).and_then(|mut f| f.write_all(root));
 }
 
+/// Default-off, log-only shader diagnostics. Nothing in here changes
+/// translation, PSO creation or the shader-cache key.
+pub(crate) mod shader_diag {
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Mutex, OnceLock};
+
+    use victory_shader::emit::{MeshEmu, MeshOutput};
+
+    use crate::pipeline::Shader;
+    use crate::switch;
+
+    /// Gate for the one-line barycentric/refusal verdict (default off).
+    static ON: OnceLock<bool> = OnceLock::new();
+    pub(crate) fn on() -> bool {
+        *ON.get_or_init(|| switch::on("VICTORY_SHADER_DIAG"))
+    }
+
+    /// Gate for the mesh-emulation layout report (default off).
+    fn mesh_on() -> bool {
+        static MESH: OnceLock<bool> = OnceLock::new();
+        *MESH.get_or_init(|| switch::on("VICTORY_MESH_ATTR_DIAG"))
+    }
+
+    static LANE_MASK: AtomicUsize = AtomicUsize::new(0);
+    static BARYCENTRIC: AtomicUsize = AtomicUsize::new(0);
+    static OTHER: AtomicUsize = AtomicUsize::new(0);
+    static PROBE_LINE: AtomicBool = AtomicBool::new(false);
+
+    /// Add one refusal to a reason bucket. Unknown reasons go to `other`.
+    /// A no-op unless `VICTORY_SHADER_DIAG` is on.
+    pub(crate) fn note_refusal(reason: &str) {
+        if !on() {
+            return;
+        }
+        let lower = reason.to_ascii_lowercase();
+        let bucket = if lower.contains("lane mask") || lower.contains("lane_mask") {
+            &LANE_MASK
+        } else if lower.contains("barycentric") {
+            &BARYCENTRIC
+        } else {
+            &OTHER
+        };
+        bucket.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The single startup/gameplay verdict line, once per process. The lane
+    /// count is read here so an off switch performs no extra feature query.
+    pub(crate) fn emit_probe(supported: bool) {
+        if !on() || PROBE_LINE.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let lanes = if crate::host::Host::wave64_only() { 64 } else { 32 };
+        tracing::info!(
+            "[shader] barycentrics={} lanes={} refusals lane_mask={} barycentric={} other={}",
+            if supported { "supported" } else { "unsupported" },
+            lanes,
+            LANE_MASK.load(Ordering::Relaxed),
+            BARYCENTRIC.load(Ordering::Relaxed),
+            OTHER.load(Ordering::Relaxed),
+        );
+    }
+
+    /// At most this many layout lines per process.
+    const MESH_CAP: usize = 64;
+    static MESH_SEEN: std::sync::LazyLock<Mutex<HashSet<String>>> =
+        std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
+    static MESH_LINES: AtomicUsize = AtomicUsize::new(0);
+
+    /// Claim one line, deduped by container hash plus attribute key.
+    fn mesh_claim(key: String) -> bool {
+        if MESH_LINES.load(Ordering::Relaxed) >= MESH_CAP {
+            return false;
+        }
+        let mut seen = MESH_SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        if !seen.insert(key) {
+            return false;
+        }
+        MESH_LINES.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    /// Whether two outputs' dword ranges collide in the same record.
+    fn overlaps(a: &MeshOutput, b: &MeshOutput) -> bool {
+        let a_end = a.dword_offset as u64 + a.cols as u64;
+        let b_end = b.dword_offset as u64 + b.cols as u64;
+        (a.dword_offset as u64) < b_end && (b.dword_offset as u64) < a_end
+    }
+
+    /// Bounded CPU-side check of the descriptor the generated unpack VS will
+    /// consume. Emitted at pipeline creation, never per draw. Generic rows
+    /// that carry a signature row (`row: Some`) are the ones the generated VS
+    /// can match to the pixel shader's inputs; the descriptor itself is the
+    /// contract the VS was built from.
+    pub(crate) fn mesh_layout(ms: &Shader, ps: Option<&Shader>, emu: &MeshEmu) {
+        if !mesh_on() {
+            return;
+        }
+        let hash = &ms.hash;
+        let ps_hash = ps.map_or("-", |s| s.hash.as_str());
+        let all: Vec<&MeshOutput> = emu
+            .vertex_outputs
+            .iter()
+            .chain(emu.prim_outputs.iter())
+            .collect();
+        let generic_matched = all
+            .iter()
+            .filter(|o| o.kind == 0 && o.row.is_some())
+            .count();
+        let has = |name: &str| {
+            all.iter()
+                .any(|o| o.name.to_ascii_lowercase().contains(name))
+        };
+
+        if mesh_claim(format!("{hash}/{ps_hash}/summary")) {
+            tracing::warn!(
+                "[shader] mesh-layout hash={hash} ps={ps_hash} group={} voff={} vstride={} poff={} pstride={} vouts={} pouts={} generic={} tangent={} normal={} texcoord={} reads_group_id={}",
+                emu.group_bytes(),
+                emu.vertex_offset_bytes(),
+                emu.vertex_stride_bytes(),
+                emu.prim_offset_bytes(),
+                emu.prim_stride_bytes(),
+                emu.vertex_outputs.len(),
+                emu.prim_outputs.len(),
+                generic_matched,
+                has("tangent"),
+                has("normal"),
+                has("texcoord"),
+                emu.reads_group_id,
+            );
+        }
+
+        for (record, limit, outputs) in [
+            ("v", emu.vertex_dwords, &emu.vertex_outputs),
+            ("p", emu.prim_dwords, &emu.prim_outputs),
+        ] {
+            for (i, o) in outputs.iter().enumerate() {
+                let mut flags: Vec<&'static str> = Vec::new();
+                let end = o.dword_offset as u64 + o.cols as u64;
+                if end > limit as u64 {
+                    flags.push("overrun");
+                }
+                if o.cols == 0 {
+                    flags.push("cols0");
+                }
+                if o.comp != 9 {
+                    flags.push("comp_nonfloat");
+                }
+                if outputs
+                    .iter()
+                    .enumerate()
+                    .any(|(j, p)| j != i && overlaps(o, p))
+                {
+                    flags.push("overlap");
+                }
+                if let Some(row) = o.row {
+                    if outputs.iter().enumerate().any(|(j, p)| {
+                        j != i && p.row == Some(row) && p.col == o.col && p.kind == o.kind
+                    }) {
+                        flags.push("duprow");
+                    }
+                }
+                if flags.is_empty() {
+                    continue;
+                }
+                let key = format!("{hash}/{ps_hash}/{record}/{}/{}/{}", o.name, o.index, o.col);
+                if mesh_claim(key) {
+                    tracing::warn!(
+                        "[shader] mesh-layout attr hash={hash} record={record} name={} index={} kind={} row={:?} col={} cols={} comp={} dword={} flags={}",
+                        o.name,
+                        o.index,
+                        o.kind,
+                        o.row,
+                        o.col,
+                        o.cols,
+                        o.comp,
+                        o.dword_offset,
+                        flags.join(","),
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Logs a pipeline that gets no host pipeline, once per reason.
 fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline> {
+    shader_diag::note_refusal(reason);
     static SEEN: std::sync::Mutex<Vec<&str>> = std::sync::Mutex::new(Vec::new());
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     if !seen.contains(&reason) {
@@ -582,6 +768,7 @@ fn barycentrics_probe(host: &Host, needing: usize, refused: bool) {
         return;
     }
     let supported = host.barycentrics();
+    shader_diag::emit_probe(supported);
     let needing = NEEDING.load(Ordering::Relaxed);
     let refused = REFUSED.load(Ordering::Relaxed);
     if refused > 0 {
@@ -882,6 +1069,9 @@ impl HostPipeline {
                     inputs = g.inputs.len(),
                     "host pipeline refused (graphics)"
                 );
+                if shader_diag::on() {
+                    shader_diag::note_refusal(&e.to_string());
+                }
                 barycentrics_probe(host, bary_need, true);
                 host.log_messages();
                 return None;
@@ -1023,6 +1213,7 @@ fn emulated_mesh_pipeline(
         Some(ps) => Some(ps.translated()?.host.dxil.as_slice()),
         None => None,
     };
+    shader_diag::mesh_layout(ms.as_ref(), ps.map(|s| s.as_ref()), emu);
     let unpack_vs = match unpack_vertex_shader(emu, ps_dxil) {
         Ok(vs) => vs,
         Err(e) => {

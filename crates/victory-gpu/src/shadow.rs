@@ -151,10 +151,21 @@ fn card_limits() -> (u64, u64) {
                 .and_then(|v| v.trim().parse::<u64>().ok())
         };
         let vram_budget = host().and_then(|h| h.video_memory()).map(|[budget, ..]| budget);
+        // Guard only the sentinel values. No numeric ceiling here: an
+        // adapter cap + 512 MB one would refuse the live 4096 MB value and
+        // change a working configuration, so it is deliberately not added.
+        let max_raw = std::env::var("VICTORY_CARD_BUFFERS_MB").ok();
+        let max_mb = match max_raw.as_deref().map(str::trim) {
+            Some(v) if v.eq_ignore_ascii_case("unlimited") || v.parse::<u64>() == Ok(0) => {
+                tracing::warn!(value = v, "VICTORY_CARD_BUFFERS_MB=0/unlimited refused; using the adapter cap");
+                None
+            }
+            other => other.and_then(|v| v.parse::<u64>().ok()),
+        };
         let (mut min_bytes, max_bytes) = resolve_card_limits(
             vram_budget,
             env_mb("VICTORY_CARD_BUFFERS_MIN_MB"),
-            env_mb("VICTORY_CARD_BUFFERS_MB"),
+            max_mb,
         );
         if let Some(kib) = std::env::var("VICTORY_CARD_BUFFERS_MIN_KB")
             .ok()
@@ -188,6 +199,59 @@ static FIND_LOOSE_BUDGET: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 /// whose root view was routed into a bounded loose window instead of a sink
 /// (the `VICTORY_ROOT_VIEW_REGISTERED_LOOSE` fix).
 static FIND_BUFFER_LOOSE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Why a root view ended at a null raw view, when the code that refused it
+/// knows the reason. `Other` is only an explicit `VICTORY_ROOT_VIEW_SINK_MB=0`
+/// or a refusal that named no reason: a cause is never inferred from a log.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NullCause {
+    WindowRefused,
+    ByteShort,
+    Budget,
+    Unmapped,
+    Other,
+}
+
+thread_local! {
+    /// The reason this thread's last root-view copy refusal gave. Set at the
+    /// refusal sites in [`find_reaching`] and [`loose`], cleared when a lookup
+    /// starts and when a null view takes it.
+    static NULL_CAUSE: std::cell::Cell<NullCause> =
+        const { std::cell::Cell::new(NullCause::Other) };
+}
+
+fn note_cause(cause: NullCause) {
+    NULL_CAUSE.with(|c| c.set(cause));
+}
+
+/// The refusal reason for a null view about to be bound, then clear it.
+pub(crate) fn take_null_cause() -> NullCause {
+    NULL_CAUSE.with(|c| c.replace(NullCause::Other))
+}
+
+/// Null raw views bound since the last [`log_views`] line, by the reason the
+/// fallback gave. The sink pool counts one decision even where two warnings
+/// describe it (`root-view sink pool spent` and `a root view has no copy`).
+static NULL_VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static NULL_WINDOW_REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static NULL_BYTE_SHORT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static NULL_BUDGET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static NULL_UNMAPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static NULL_OTHER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Counts one null raw view and the reason known at the decision that bound
+/// it. Called by the sink pool in [`crate::draw`], never from a log record.
+pub(crate) fn note_null_view(cause: NullCause) {
+    use std::sync::atomic::Ordering::Relaxed;
+    NULL_VIEWS.fetch_add(1, Relaxed);
+    match cause {
+        NullCause::WindowRefused => NULL_WINDOW_REFUSED.fetch_add(1, Relaxed),
+        NullCause::ByteShort => NULL_BYTE_SHORT.fetch_add(1, Relaxed),
+        NullCause::Budget => NULL_BUDGET.fetch_add(1, Relaxed),
+        NullCause::Unmapped => NULL_UNMAPPED.fetch_add(1, Relaxed),
+        NullCause::Other => NULL_OTHER.fetch_add(1, Relaxed),
+    };
+}
 
 /// Whether a registered buffer refused by the card-buffers budget gets a
 /// bounded loose window for its root views instead of a per-address sink
@@ -229,10 +293,23 @@ fn idle_frames() -> u64 {
 fn window_limit() -> usize {
     static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *LIMIT.get_or_init(|| {
-        let n = std::env::var("VICTORY_ROOT_VIEW_WINDOWS")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(256);
+        const DEFAULT: usize = 256;
+        const CEILING: usize = DEFAULT + 512;
+        let raw = std::env::var("VICTORY_ROOT_VIEW_WINDOWS").ok();
+        let n = match raw.as_deref().map(str::trim) {
+            None | Some("") => DEFAULT,
+            Some(v) if v.eq_ignore_ascii_case("unlimited") => {
+                tracing::warn!(value = v, "VICTORY_ROOT_VIEW_WINDOWS=unlimited refused; using the default");
+                DEFAULT
+            }
+            Some(v) => match v.parse::<usize>() {
+                Ok(n) if n > 0 && n <= CEILING => n,
+                _ => {
+                    tracing::warn!(value = v, ceiling = CEILING, "VICTORY_ROOT_VIEW_WINDOWS out of range; using the default");
+                    DEFAULT
+                }
+            },
+        };
         tracing::info!(loose_window_limit = n, "root-view window ceiling");
         n
     })
@@ -1179,6 +1256,7 @@ fn find_inner(address: u64, len: u64, count: bool) -> Option<Arc<Shadow>> {
 /// `reach` bytes after `address`. A window ending sooner than the data read
 /// through the view is a GPU page fault.
 pub(crate) fn find_reaching(address: u64, reach: u64) -> Option<Arc<Shadow>> {
+    note_cause(NullCause::Other);
     if in_buffer(&buffers(), address) {
         // The buffer is registered but its copy may have been refused by the
         // budget. Before giving the draw a 1 MiB fallback sink (another
@@ -1190,6 +1268,7 @@ pub(crate) fn find_reaching(address: u64, reach: u64) -> Option<Arc<Shadow>> {
         if evict_unused(0, None) > 0 && let Some(shadow) = find_inner(address, 1, false) {
             return Some(shadow);
         }
+        note_cause(NullCause::Budget);
         FIND_BUFFER_BUDGET.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if registered_loose() {
             // The registered copy is genuinely refused. A sink would be one
@@ -1203,6 +1282,7 @@ pub(crate) fn find_reaching(address: u64, reach: u64) -> Option<Arc<Shadow>> {
         }
         return None;
     }
+    note_cause(NullCause::Other);
     FIND_OUTSIDE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     loose(address, address.checked_add(reach)?)
 }
@@ -1282,9 +1362,16 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     // Both ceilings are enforced before a new allocation. The oldest
     // unused windows go first; give up if every remaining one is in use.
     let at_limit = || loose_len() >= window_limit();
-    if !shadow_room(len) || at_limit() {
+    let room = shadow_room(len);
+    let limit = room && at_limit();
+    if !room || limit {
         evict_unused(0, Some(window_limit().saturating_sub(1)));
-        if !shadow_room(len) || at_limit() {
+        let room = shadow_room(len);
+        let limit = room && at_limit();
+        if !room || limit {
+            // Both guards are checked here, so the code knows which one
+            // still refuses after eviction; do not infer it from a counter.
+            note_cause(if room { NullCause::WindowRefused } else { NullCause::Budget });
             FIND_LOOSE_BUDGET.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return None;
         }
@@ -1314,6 +1401,10 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
             match host()?.shared_buffer(len) {
                 Some(allocated) => allocated,
                 None => {
+                    // The host refused to map a window twice, even after
+                    // every unused one was released: an unmapped allocation,
+                    // not a guess from the shadow byte counter.
+                    note_cause(NullCause::Unmapped);
                     FIND_LOOSE_BUDGET.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     return None;
                 }
@@ -1522,6 +1613,30 @@ pub(crate) fn log_views(frames: f64) {
             bytes as f64 / (1 << 20) as f64,
             SHADOW_BYTES.load(Relaxed) as f64 / (1 << 20) as f64
         );
+    }
+    // Same counter swap, same logging window as the lines above (~5 s of
+    // gameplay frames): at most one line per window, and none when no null
+    // view was bound. Both WARN records are two views of one sink decision.
+    let [nulls, refused, short, budget, unmapped, other] = [
+        &NULL_VIEWS,
+        &NULL_WINDOW_REFUSED,
+        &NULL_BYTE_SHORT,
+        &NULL_BUDGET,
+        &NULL_UNMAPPED,
+        &NULL_OTHER,
+    ]
+    .map(|c| c.swap(0, Relaxed));
+    if nulls > 0 {
+        tracing::info!(
+            "[root-view] null_views={nulls} cause_window_refused={refused} cause_byte_short={short} \
+             cause_budget={budget} cause_unmapped={unmapped} windows={windows}/{} loose_mb={:.1} other={other}",
+            window_limit(),
+            bytes as f64 / (1 << 20) as f64
+        );
+    }
+    let (clamped, placeholder) = crate::resource::take_texcap();
+    if clamped + placeholder > 0 {
+        tracing::info!("texcap clamped={clamped} placeholder={placeholder}");
     }
 }
 

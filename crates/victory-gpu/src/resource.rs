@@ -239,26 +239,75 @@ pub(crate) fn pc_format(format: u32) -> u32 {
 
 /// The opt-in packed-light format substitution.
 ///
-/// `VICTORY_LIGHT_FORMAT_FLOAT=1` makes host render targets and unordered
-/// access textures the title describes as R9G9B9E5_SHAREDEXP (67) be
-/// R16G16B16A16_FLOAT (10) instead, and makes views of such textures name
-/// the same float format. The title packs bounced light and sky probes as
+/// `VICTORY_LIGHT_FORMAT_FLOAT=1` hosts the light image as
+/// R16G16B16A16_FLOAT (10) instead of the title's packed R9G9B9E5 in
+/// R32_UINT (42). The title packs bounced light and sky probes as
 /// R9G9B9E5 in R32_UINT textures because compute shaders cannot write the
-/// shared-exponent format; on some AMD/Polaris parts that format path reads
-/// back black or corrupt. Keeping the host resource, its views and the
-/// present path in one format (RGBA16F) avoids the broken conversion.
-/// Unset, `0` or `off` keeps the title's formats byte for byte, so nothing
-/// changes for hosts that handle R9G9B9E5 correctly.
+/// shared-exponent format; on some parts that format path reads back black
+/// or corrupt. Keeping the host resource, its views, clears, copies and the
+/// stand-in's `raise` program in one format avoids the broken conversion.
+/// Unset, `0` or `off` keeps the title's formats byte for byte.
+///
+/// [`light_effective_format`] is the single cached decision every format
+/// touchpoint reads, so the resource, its views and the ambient program can
+/// no longer disagree about what the light image contains.
+const LIGHT_NATIVE: u32 = 42;
+const LIGHT_FLOAT: u32 = 10;
+/// Title formats that hold packed light: the R9G9B9E5 description (67) and
+/// the R32_UINT (42) the compute programs actually write.
+const LIGHT_TARGETS: [u32; 2] = [67, 42];
+
+fn light_format_for(float: bool) -> u32 {
+    if float { LIGHT_FLOAT } else { LIGHT_NATIVE }
+}
+
+/// The one cached decision for the packed-light host format. `42` is the
+/// title's native R32_UINT image holding packed R9G9B9E5; `10` is the opt-in
+/// RGBA16F stand-in. Every format touchpoint reads this instead of the
+/// environment, so creation, views, clears, copies and the `raise` program
+/// cannot pick different formats.
+pub(crate) fn light_effective_format() -> u32 {
+    static EFFECTIVE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let effective = *EFFECTIVE.get_or_init(|| {
+        let float = std::env::var("VICTORY_LIGHT_FORMAT_FLOAT")
+            .is_ok_and(|v| v.trim() == "1" || v.trim().eq_ignore_ascii_case("on"));
+        light_format_for(float)
+    });
+    static REPORTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    REPORTED.get_or_init(|| {
+        let mode = if effective == LIGHT_FLOAT { "float" } else { "native" };
+        // The gate compares the creation table for the written light image
+        // with the format the stand-in writes; both read this one decision.
+        let gate = if target_format_for(42, effective) == effective { "ok" } else { "mismatch" };
+        tracing::info!(
+            mode = mode,
+            effective = effective,
+            gate = gate,
+            "[lighting] format mode={mode} effective={effective} gate={gate}"
+        );
+    });
+    effective
+}
+
+/// Whether the opt-in float stand-in is active. A view of
+/// [`light_effective_format`], not a second read of the switch.
 pub(crate) fn light_float_format() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var("VICTORY_LIGHT_FORMAT_FLOAT")
-            .is_ok_and(|v| v.trim() == "1" || v.trim().eq_ignore_ascii_case("on"))
-    })
+    light_effective_format() == LIGHT_FLOAT
+}
+
+/// Pure creation-format table: native is the identity; the float stand-in
+/// maps only the packed-light targets to RGBA16F.
+fn target_format_for(format: u32, effective: u32) -> u32 {
+    if effective == LIGHT_FLOAT && LIGHT_TARGETS.contains(&format) {
+        LIGHT_FLOAT
+    } else {
+        format
+    }
 }
 
 /// Whether the host renders to and stores through typed UAVs of `format`.
-/// A stand-in is only worth using where the host refuses the packed format.
+/// Diagnostic only now: [`light_effective_format`] is the decision, so a
+/// host that accepts the packed format still honours an explicit opt-in.
 #[cfg(windows)]
 fn packed_target_supported(format: u32) -> bool {
     use windows::Win32::Graphics::Direct3D12::*;
@@ -293,24 +342,22 @@ fn packed_target_supported(format: u32) -> bool {
 }
 
 /// The format of a texture the host renders to or writes as unordered
-/// access, for the title's `format`. Only active with
-/// [`light_float_format`], and only where the host itself refuses the
-/// packed format: R9G9B9E5_SHAREDEXP stands in as R16G16B16A16_FLOAT. The
-/// title's pipelines and views of such a target name the stand-in too
-/// ([`view_format`], the host view checks).
+/// access, for the title's `format`. [`light_effective_format`] is the only
+/// decision: both the R9G9B9E5 description (67) and the R32_UINT (42) the
+/// compute programs write become RGBA16F under the opt-in. The capability
+/// probe below is a one-time diagnostic, never a gate, so creation cannot
+/// disagree with the views or the ambient program.
 pub(crate) fn target_format(format: u32) -> u32 {
-    const PACKED: [(u32, u32); 1] = [(67, 10)];
-    if !light_float_format() {
-        return format;
-    }
-    let Some(&(_, stand_in)) = PACKED.iter().find(|&&(f, _)| f == format) else {
-        return format;
-    };
+    let effective = light_effective_format();
+    let mapped = target_format_for(format, effective);
     #[cfg(windows)]
-    if packed_target_supported(format) {
-        return format;
+    {
+        if mapped != format {
+            // The opt-in decides; the probe only reports what the host can do.
+            let _ = packed_target_supported(format);
+        }
     }
-    stand_in
+    mapped
 }
 
 /// Whether `this`'s host copy is in the float stand-in: its texels are not
@@ -333,16 +380,22 @@ fn stands_in(this: This) -> bool {
 /// (42) and reads typeless 9 views; all three name RGBA16F (10) once the
 /// host texture is the stand-in, so the pipeline and the views agree.
 pub(crate) fn stand_in_view_format(host: u32, requested: u32) -> u32 {
-    if !light_float_format() {
+    stand_in_view_format_for(light_effective_format(), host, requested)
+}
+
+/// Pure view-format table for a host format and a requested format. Native
+/// mode is the identity, byte for byte as before.
+fn stand_in_view_format_for(effective: u32, host: u32, requested: u32) -> u32 {
+    if effective == LIGHT_NATIVE {
         return requested;
     }
-    if host == 10 && matches!(requested, 9 | 42 | 67) {
+    if host == LIGHT_FLOAT && (requested == 9 || LIGHT_TARGETS.contains(&requested)) {
         // A stand-in target's light views: packed SRV, R32_UINT UAV, and
         // typeless 16-bit views all name the float format.
-        10
+        LIGHT_FLOAT
     } else if host == 9 && requested == 9 {
         // A typeless 16-bit-per-channel host texture needs a typed view.
-        10
+        LIGHT_FLOAT
     } else {
         requested
     }
@@ -353,8 +406,13 @@ pub(crate) fn stand_in_view_format(host: u32, requested: u32) -> u32 {
 /// sampled as RGBA16F; otherwise the title's own format stands (the host
 /// refuses typeless views). `None` leaves the view alone.
 pub(crate) fn default_shader_format(format: u32) -> Option<u32> {
-    if light_float_format() && pc_format(format) == 9 {
-        Some(10)
+    default_shader_format_for(light_effective_format(), format)
+}
+
+/// Pure default-view format table, kept beside the other format tables.
+fn default_shader_format_for(effective: u32, format: u32) -> Option<u32> {
+    if effective == LIGHT_FLOAT && pc_format(format) == 9 {
+        Some(LIGHT_FLOAT)
     } else {
         None
     }
@@ -519,6 +577,16 @@ fn texture_budget_bytes() -> Option<u64> {
 /// targets, depth and unordered-access textures are drawn at the title's own
 /// sizes, and a non-power-of-two texture (a 1920x1080 UI plane) must keep its
 /// exact dimensions. Never drops below a 256-pixel side.
+/// Cap/placeholder counts for one diagnostics window: [clamped, placeholder].
+pub(crate) static TEXCAP: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Take and clear the texture-cap counts for this diagnostics window.
+pub(crate) fn take_texcap() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (TEXCAP[0].swap(0, Relaxed), TEXCAP[1].swap(0, Relaxed))
+}
+
 pub(crate) fn texture_mip_drop(desc: &ResourceDesc) -> u32 {
     let cap = texture_cap();
     let budget = texture_budget_bytes();
@@ -535,7 +603,11 @@ pub(crate) fn texture_mip_drop(desc: &ResourceDesc) -> u32 {
     // Console layout size is a close enough estimate of the host allocation
     // for a budget decision; every mip dropped quarters the bytes.
     let bytes = texture_layout(desc).map_or(0, |t| t.size);
-    mip_drop_for(w, h, mip_count(desc), bytes, cap, budget)
+    let drop = mip_drop_for(w, h, mip_count(desc), bytes, cap, budget);
+    if drop > 0 {
+        TEXCAP[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    drop
 }
 
 /// Pure form of the cap decision, so it can be tested without a host or env.
@@ -570,7 +642,11 @@ fn mip_drop_for(
 /// `None` means the title names a level the host left out, so the copy or
 /// resolve must be dropped rather than redirected to the wrong mip.
 pub(crate) fn host_subresource(drop: u32, sub: u32) -> Option<u32> {
-    sub.checked_sub(drop)
+    let host = sub.checked_sub(drop);
+    if drop > 0 && host.is_none() {
+        TEXCAP[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    host
 }
 
 /// Shift an SRV's mip window from the title's chain onto a host texture with
@@ -1368,10 +1444,10 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
         d.flags &= !UNORDERED;
     }
     d.format = pc_format(d.format);
-    // Opt-in packed-light substitution: a target/UAV the title describes
-    // as R9G9B9E5 is hosted as RGBA16F where the host refuses the packed
-    // format. Its views are remapped to the same format in
-    // `descriptor::host` so the pipeline stays consistent.
+    // Opt-in packed-light substitution: a target/UAV holding packed light
+    // (R9G9B9E5 or the R32_UINT it is written through) is hosted as RGBA16F
+    // when `light_effective_format` says so. Its views are remapped to the
+    // same format in `descriptor::host` so the pipeline stays consistent.
     if d.flags & USES & (RENDER_TARGET_FLAG | UNORDERED) != 0 {
         d.format = target_format(d.format);
     }
@@ -1801,8 +1877,8 @@ static TEXTURES_AT: std::sync::Mutex<std::collections::BTreeMap<u64, Vec<usize>>
 /// texels are read directly; when they do not (another mip or slice, or a
 /// cast the host refused), this finds the written texture and the read
 /// copies its bytes. With `VICTORY_LIGHT_FORMAT_FLOAT=1` a substituted
-/// target is excluded: its host texels are RGBA16F, not the title's packed
-/// words, so a raw copy would read garbage.
+/// target (R9G9B9E5 or R32_UINT) is excluded: its host texels are RGBA16F,
+/// not the title's packed words, so a raw copy would read garbage.
 /// shortcut: same start only; overlapping ranges, other mips or slices of
 /// one memory, and views of buffers are not matched.
 #[cfg(windows)]
@@ -2304,11 +2380,44 @@ mod tests {
         // The switch is read from the environment once, and the test suite
         // does not set it: the title's formats must be kept by default.
         assert!(!light_float_format());
+        assert_eq!(light_effective_format(), LIGHT_NATIVE);
         assert_eq!(target_format(67), 67);
         assert_eq!(target_format(42), 42);
         assert_eq!(stand_in_view_format(42, 67), 67);
         assert_eq!(stand_in_view_format(10, 9), 9);
         assert_eq!(default_shader_format(9), None);
+    }
+
+    #[test]
+    fn light_format_table_maps_only_packed_light_targets() {
+        // Pure tables, independent of the cached environment decision. Only
+        // short synthetic format numbers appear here by repo policy.
+        assert_eq!(light_format_for(false), LIGHT_NATIVE);
+        assert_eq!(light_format_for(true), LIGHT_FLOAT);
+        assert_eq!(LIGHT_TARGETS, [67, 42]);
+        // Native is byte-identical: every title format and view is kept.
+        for format in [7, 9, 10, 42, 67, 68] {
+            assert_eq!(target_format_for(format, LIGHT_NATIVE), format);
+            assert_eq!(stand_in_view_format_for(LIGHT_NATIVE, 10, format), format);
+        }
+        assert_eq!(default_shader_format_for(LIGHT_NATIVE, 9), None);
+        // Float maps only the two packed-light targets, nothing else.
+        assert_eq!(target_format_for(42, LIGHT_FLOAT), LIGHT_FLOAT);
+        assert_eq!(target_format_for(67, LIGHT_FLOAT), LIGHT_FLOAT);
+        for format in [7, 9, 10, 68] {
+            assert_eq!(target_format_for(format, LIGHT_FLOAT), format);
+        }
+        // Views of the stand-in and typeless 16-bit textures name RGBA16F.
+        assert_eq!(stand_in_view_format_for(LIGHT_FLOAT, 10, 9), LIGHT_FLOAT);
+        assert_eq!(stand_in_view_format_for(LIGHT_FLOAT, 10, 42), LIGHT_FLOAT);
+        assert_eq!(stand_in_view_format_for(LIGHT_FLOAT, 10, 67), LIGHT_FLOAT);
+        assert_eq!(stand_in_view_format_for(LIGHT_FLOAT, 9, 9), LIGHT_FLOAT);
+        assert_eq!(stand_in_view_format_for(LIGHT_FLOAT, 7, 7), 7);
+        assert_eq!(default_shader_format_for(LIGHT_FLOAT, 9), Some(LIGHT_FLOAT));
+        assert_eq!(default_shader_format_for(LIGHT_FLOAT, 42), None);
+        // The written image's creation format is what the gate checks.
+        assert_eq!(target_format_for(42, LIGHT_FLOAT), light_format_for(true));
+        assert_eq!(target_format_for(42, LIGHT_NATIVE), light_format_for(false));
     }
 
     #[test]
