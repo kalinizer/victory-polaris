@@ -752,7 +752,9 @@ pub struct Format {
 }
 
 /// By DXGI format number. `None` for 96-bit, 1-bit, packed 4:2:2 and video
-/// formats.
+/// formats. The console-only 189 (R10G10B10_SNORM_A2_UNORM), 190 (R4G4_UNORM)
+/// and 191 (R24G8_UNORM) have layouts here by their element sizes, as they do
+/// in `victory_gpu::resource::element`.
 ///
 /// shortcut: those formats have no layout here; add them when a title uses
 /// one.
@@ -761,10 +763,10 @@ pub fn format(dxgi: u32) -> Option<Format> {
         1..=4 => (16, 1, false),
         9..=18 => (8, 1, false),
         19..=22 | 44..=47 => (4, 1, true),
-        23..=43 | 67 | 87..=93 | 116 | 117 => (4, 1, false),
+        23..=43 | 67 | 87..=93 | 116 | 117 | 189 | 191 => (4, 1, false),
         48..=59 | 85 | 86 | 115 => (2, 1, false),
         118..=120 => (2, 1, true),
-        60..=65 => (1, 1, false),
+        60..=65 | 190 => (1, 1, false),
         70..=72 | 79..=81 => (8, 4, false),
         73..=78 | 82..=84 | 94..=99 => (16, 4, false),
         _ => return None,
@@ -880,6 +882,28 @@ mod tests {
             block: 1,
             samples: 1,
             swizzle,
+        }
+    }
+
+    #[test]
+    fn console_only_formats_have_layouts() {
+        // R10G10B10_SNORM_A2_UNORM and R24G8_UNORM are four bytes per texel;
+        // R4G4_UNORM is one. Their layouts use the same element size as the
+        // GPU resource tables, without changing any existing format.
+        for &(dxgi, bytes) in &[(189, 4), (190, 1), (191, 4)] {
+            assert_eq!(format(dxgi), Some(Format { bytes, block: 1, stencil: false }));
+            let d = TextureDesc {
+                dimension: Dimension::Tex2d,
+                width: 64,
+                height: 64,
+                depth_or_array: 1,
+                mips: 1,
+                format: dxgi,
+                samples: 1,
+                swizzle: Swizzle::SW_4KB_S,
+            };
+            let t = Texture::new(&d).unwrap();
+            assert!(t.size >= 64 * 64 * bytes as u64);
         }
     }
 

@@ -42,6 +42,96 @@ use std::sync::{Arc, Mutex};
 /// they saved.
 pub(crate) const PAGE: usize = 64 << 10;
 
+/// Ranges the runtime made `PAGE_GRAPHICS_READONLY`: shaders cannot write
+/// them, so no host copy needs putting back. Filled only with
+/// `VICTORY_XMEM_WATCH_FILTER=1`; the map is (start, end) in bytes.
+static GPU_READONLY: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
+
+/// The runtime made `[start, start + len)` read-only to the GPU (XMem's
+/// `PAGE_GRAPHICS_READONLY`). Shaders cannot have written it, so the copies
+/// in `crate::shadow` and the readbacks in `crate::texback` do not go back
+/// into title memory. Opt-in, for A/B: `VICTORY_XMEM_WATCH_FILTER=1`.
+pub fn xmem_gpu_readonly(start: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let end = start.saturating_add(len);
+    let mut marks = GPU_READONLY.lock().unwrap_or_else(|e| e.into_inner());
+    // A new allocation replaces any earlier mark that reached into it.
+    marks.retain(|&a, b| *b <= start || a >= end);
+    marks.insert(start, end);
+}
+
+/// The runtime made `[start, start + len)` writable again (an address reused
+/// for another allocation): it must not inherit an old read-only mark.
+pub fn xmem_gpu_writable(start: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let end = start.saturating_add(len);
+    GPU_READONLY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|&a, b| *b <= start || a >= end);
+}
+
+/// Whether `[start, start + len)` lies wholly in read-only title memory.
+/// Marks may be adjacent (one XMem range per allocation), so coverage is
+/// joined across them; a partially covered range stays writable.
+fn gpu_readonly(start: usize, len: usize) -> bool {
+    if len == 0 {
+        return false;
+    }
+    let end = start.saturating_add(len);
+    let marks = GPU_READONLY.lock().unwrap_or_else(|e| e.into_inner());
+    let mut covered = start;
+    for (&a, &b) in marks.range(..end) {
+        if b <= start {
+            continue;
+        }
+        if a > covered {
+            break;
+        }
+        covered = covered.max(b);
+        if covered >= end {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether a GPU copy-back of `[start, start + len)` can be skipped because
+/// the runtime declared the memory GPU read-only (diagnostics count it).
+pub(crate) fn skip_gpu_copy_back(start: usize, len: usize) -> bool {
+    if !gpu_readonly(start, len) {
+        return false;
+    }
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::ReadOnlySkippedBytes, len as u64);
+    true
+}
+
+/// The runtime left a reservation unwatched under `VICTORY_XMEM_WATCH_FILTER`:
+/// `reason` 1 is CPU-only memory, 2 a read-only protection, 3 a mappable
+/// reservation. Counts ranges and their bytes in the copy diagnostics.
+pub fn xmem_watch_skipped(reason: u8, bytes: usize) {
+    let _ = (reason, bytes); // used only with the diagnostics feature
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{C, add};
+        add(
+            match reason {
+                1 => C::XmemSkippedCpu,
+                2 => C::XmemSkippedReadonly,
+                3 => C::XmemSkippedMappable,
+                _ => return,
+            },
+            1,
+        );
+        add(C::XmemSkippedBytes, bytes as u64);
+    }
+}
+
 /// The pages a tracker has not taken since they changed, and what it saves
 /// of pages it armed.
 struct Changed(Mutex<BTreeSet<usize>>, Mutex<Saved>);
@@ -679,6 +769,23 @@ pub(crate) mod tests {
     pub(crate) fn free(p: usize) {
         // SAFETY: an allocation of ours.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// GPU read-only marks cover whole copies, join across allocations, and
+    /// go away when the runtime reuses the address for writable memory.
+    #[test]
+    fn gpu_readonly_marks_cover_whole_ranges() {
+        let (first, middle) = (0x40_0000, 0x41_0000);
+        xmem_gpu_readonly(first, PAGE);
+        xmem_gpu_readonly(middle, PAGE);
+        assert!(skip_gpu_copy_back(first, PAGE));
+        assert!(skip_gpu_copy_back(first + PAGE, PAGE));
+        assert!(!skip_gpu_copy_back(first, 2 * PAGE + 1), "partly writable");
+        assert!(!skip_gpu_copy_back(first - 1, PAGE + 1), "partly writable");
+        xmem_gpu_writable(middle, PAGE);
+        assert!(!skip_gpu_copy_back(middle, PAGE));
+        assert!(skip_gpu_copy_back(first, PAGE), "the other mark stays");
+        xmem_gpu_writable(first, PAGE);
     }
 
     /// Everything is changed at first; after taking, only what is written

@@ -249,6 +249,13 @@ pub fn loop_limit() -> u32 {
     })
 }
 
+/// Whether a barycentric input used only through a data join is loaded there
+/// (`VICTORY_JOIN_FIX`, on by default). Part of the shader-cache key in
+/// `victory-gpu`, so toggling the flag never serves a cached refusal.
+pub fn join_fix_enabled() -> bool {
+    lower::join_fix_enabled()
+}
+
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
 /// unreadable or 0. Pure, for testing.
 fn parse_loop_limit(value: Option<&str>) -> u32 {
@@ -650,6 +657,8 @@ mod tests {
     use super::shader::Shader;
     use super::*;
     use crate::native::{ComputeIo, StageIo};
+
+    const S_ENDPGM: u32 = 0xBF81_0000;
 
     /// A pixel shader writing SV_StencilRef (channel y of `exp mrtz`).
     /// DXC sets ShaderFlags.StencilRef (bit 11) for a pixel shader whose
@@ -1245,6 +1254,43 @@ mod tests {
             v.validate(&mut out.dxil.clone()).unwrap();
         }
         Ok(out)
+    }
+
+    /// A barycentric input whose only use is a data join is loaded there
+    /// instead of refusing the join (upstream VIctory PR #570).
+    #[test]
+    fn a_barycentric_input_on_a_live_join_is_loaded() {
+        // v0 is i (SPI_PS_INPUT_ADDR bit 1), v2 is SV_Position.x (bit 8).
+        // The two paths assign different values to v0, so the join's phi
+        // takes the input itself on the skipped edge; the export is its only
+        // reader. Without the fix the phi has no incoming DXIL value.
+        let words = [
+            0x7D84_0480, // v_cmp_eq_u32 vcc, 0, v2
+            0xBF86_0001, // s_cbranch_vccz -> the join
+            0x7E00_0281, // v_mov_b32 v0, 1
+            0xF800_180F, // exp mrt0, v0, v0, v0, v0 done vm
+            0x0000_0000,
+            S_ENDPGM,
+        ];
+        let el = |name: &str, kind, row| SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp: 9,
+            interp: 0,
+            row: Some(row),
+            col: 0,
+            cols: 4,
+            usage: 0b1111,
+            half: false,
+        };
+        let isg1 = container::signature(
+            &[el("TEXCOORD", 0, 0), el("SV_Position", 3, 3)],
+            true,
+        );
+        let osg1 = container::signature(&[el("SV_Target", 16, 0)], false);
+        emit_pixel(&words, vec![], 1 << 1 | 1 << 8, &isg1, &osg1)
+            .expect("the barycentric input reaches the export through a join");
     }
 
     /// A float4 element per row (16-bit ones declared so in the part).

@@ -22,16 +22,20 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCSTR, PCWSTR, s, w};
 
 /// Resource states without the console's own bits (compression hints from
-/// bit 25 up), which the host rejects.
+/// bit 25 up), which the host rejects. Gen9's PRESENT is bit 20, a gap in
+/// PC's `D3D12_RESOURCE_STATES` (0 on PC), so that bit is console-only too.
 pub(crate) fn pc_state(state: u32) -> u32 {
-    state & 0x01ff_ffff
+    const CONSOLE_PRESENT: u32 = 0x10_0000;
+    state & 0x01ff_ffff & !CONSOLE_PRESENT
 }
 
 /// A console state as a host texture state: PC bits only, and none of the
 /// buffer-only ones the console allows on textures (vertex, constant and
-/// index buffer, stream out, indirect arguments, as in "generic read").
+/// index buffer, stream out, indirect arguments, as in "generic read", and
+/// the raytracing acceleration structure state, which PC accepts on buffers
+/// only).
 pub(crate) fn texture_state(state: u32) -> u32 {
-    const BUFFER_ONLY: u32 = 0x1 | 0x2 | 0x100 | 0x200;
+    const BUFFER_ONLY: u32 = 0x1 | 0x2 | 0x100 | 0x200 | 0x40_0000;
     pc_state(state) & !BUFFER_ONLY
 }
 
@@ -446,6 +450,22 @@ mod tests {
     }
 
     use super::*;
+
+    /// The console's PRESENT (bit 20) has no PC state: drop it for buffers
+    /// and textures alike, but keep every bit that is a real PC state.
+    #[test]
+    fn console_states_strip_present_and_texture_only_buffer_bits() {
+        const PRESENT: u32 = 0x10_0000;
+        const RAYTRACING: u32 = 0x40_0000;
+        assert_eq!(pc_state(PRESENT), 0);
+        assert_eq!(pc_state(0x800 | PRESENT), 0x800);
+        assert_eq!(pc_state(u32::MAX), 0x01ef_ffff);
+        // Raytracing acceleration structures exist on PC buffers, not
+        // textures; the other buffer-only states were already stripped.
+        assert_eq!(texture_state(PRESENT | RAYTRACING), 0);
+        assert_eq!(texture_state(0x800 | RAYTRACING), 0x800);
+        assert_eq!(texture_state(0x1 | 0x2 | 0x100 | 0x200 | 0x800), 0x800);
+    }
 
     #[test]
     fn list_scratch_grows_to_fit_and_reuses_fenced_chunks() {

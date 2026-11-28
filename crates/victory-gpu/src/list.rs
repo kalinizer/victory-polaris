@@ -323,6 +323,8 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
             let (texture, before) = list.transition(b.first, wanted)?;
             Some(Barrier {
                 kind: 0,
+                // PC rejects a console-only bit 16 here; build the barrier
+                // ourselves rather than forwarding the title's flags.
                 flags: 0,
                 first: texture.as_raw().cast_const().cast(),
                 second: 0xffff_ffff | (u64::from(before) << 32),
@@ -330,6 +332,8 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
             })
         }
         1 => Some(Barrier {
+            // PC takes no flags on aliasing barriers.
+            flags: 0,
             first: if b.first.is_null() {
                 b.first
             } else {
@@ -343,6 +347,8 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
             ..*b
         }),
         2 => Some(Barrier {
+            // PC takes no flags on UAV barriers either.
+            flags: 0,
             first: if b.first.is_null() {
                 b.first
             } else {

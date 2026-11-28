@@ -2357,6 +2357,19 @@ mod tests {
         assert_eq!(family(66), 66);
     }
 
+    /// The console-only formats have element sizes and texture layouts; no
+    /// existing mapping is changed, and they are left without a host stand-in
+    /// (a PC format of another family would make their views fail `fits`).
+    #[test]
+    fn console_only_formats_have_sizes_and_layouts() {
+        for &(format, bytes) in &[(189, 4), (190, 1), (191, 4)] {
+            assert_eq!(element(format), Some((bytes, 1)), "format {format}");
+            let desc = texture(64, 64, format, 1);
+            assert!(texture_layout(&desc).is_some(), "format {format}");
+            assert!(footprint(&desc).is_some_and(|i| i.size > 0), "format {format}");
+        }
+    }
+
     type Release = extern "system" fn(This) -> u32;
     type Map = extern "system" fn(This, u32, *const c_void, *mut *mut u8) -> HRESULT;
     type Address = extern "system" fn(This) -> u64;

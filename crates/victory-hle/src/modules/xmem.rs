@@ -20,8 +20,9 @@ use windows_sys::Win32::System::Memory::{
     CreateFileMappingW, MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER,
     MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
     MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3,
-    MemExtendedParameterAddressRequirements, PAGE_NOACCESS, PAGE_READWRITE, SEC_COMMIT,
-    SEC_RESERVE, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree, VirtualQueryEx,
+    MemExtendedParameterAddressRequirements, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
+    SEC_COMMIT, SEC_RESERVE, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree,
+    VirtualQueryEx,
 };
 use windows_sys::Win32::System::ProcessStatus::{
     K32GetPerformanceInfo, K32GetProcessMemoryInfo, PERFORMANCE_INFORMATION,
@@ -68,6 +69,56 @@ const ADDRESS_32BIT: u64 = 4;
 /// The host's write watching (not in windows-sys' memory module).
 const MEM_WRITE_WATCH: u32 = 0x20_0000;
 
+// XMem allocation flags. These are the values the console's headers give;
+// titles also pass bits we do not use here (bit 33 asks for a 32-bit address).
+/// CPU-only memory: the GPU cannot reach it, so it needs no write watching.
+const XMEM_CPU: u64 = 0x1;
+/// Memory both processors reach (the CPU and graphics bits together).
+const XMEM_GRAPHICS: u64 = 0x3;
+/// A reservation standing in for physical pages mapped into it later: a
+/// placeholder, not memory whose writes a watch could see.
+const XMEM_MAPPABLE: u64 = 0x20;
+// Console protection bits above the host's (`HOST_PROTECTION`).
+const PAGE_GRAPHICS_NOACCESS: u32 = 0x800;
+const PAGE_GRAPHICS_READONLY: u32 = 0x1000;
+#[cfg(test)]
+const PAGE_GRAPHICS_READWRITE: u32 = 0x2000;
+
+/// Whether to leave write watching off for XMem ranges that cannot be
+/// GPU-written. Opt-in A/B switch: `VICTORY_XMEM_WATCH_FILTER=1`. Default off
+/// because unwatched ranges a host copy takes are copied whole on refresh.
+fn watch_filter() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| {
+        let on = std::env::var("VICTORY_XMEM_WATCH_FILTER").as_deref() == Ok("1");
+        if on {
+            tracing::info!("XMem write-watch filtering is on (VICTORY_XMEM_WATCH_FILTER=1)");
+        }
+        on
+    });
+    *ON
+}
+
+/// Why the opt-in filter leaves a reservation unwatched: 1 CPU-only,
+/// 2 read-only protection, 3 a mappable reservation. A 64 KiB-page
+/// placeholder is already unwatched in the baseline and is not counted.
+fn watch_skip_reason(kind: u32, flags: u64, protect: u32) -> Option<u8> {
+    if kind & MEM_RESERVE_PLACEHOLDER != 0 {
+        return None;
+    }
+    if flags & XMEM_MAPPABLE != 0 {
+        return Some(3);
+    }
+    if flags & XMEM_CPU != 0 && flags & XMEM_GRAPHICS != XMEM_GRAPHICS {
+        return Some(1);
+    }
+    if protect & (PAGE_GRAPHICS_NOACCESS | PAGE_GRAPHICS_READONLY) != 0
+        || matches!(protect & HOST_PROTECTION, PAGE_READONLY | PAGE_NOACCESS)
+    {
+        return Some(2);
+    }
+    None
+}
+
 /// The addresses XMem `flags` allow, first and last: the low 4 GiB for
 /// 32-bit memory; else from 4 GiB (kept for 32-bit requests, which the
 /// title's big pools would otherwise crowd out) up to 46 down to 40 bits
@@ -92,6 +143,12 @@ pub extern "system" fn XMemVirtualAlloc(
     protect: u32,
 ) -> *mut c_void {
     let (lowest, highest) = address_range(flags);
+    // Decide from the title's own arguments, before the host bits are
+    // cleaned: the console's GPU access bits live above `HOST_PROTECTION`.
+    let requested_protect = protect;
+    let watch_skip = watch_filter()
+        .then(|| watch_skip_reason(kind, flags, protect))
+        .flatten();
     let mut requirements = MEM_ADDRESS_REQUIREMENTS {
         LowestStartingAddress: lowest as *mut c_void,
         HighestEndingAddress: highest as *mut c_void,
@@ -131,8 +188,9 @@ pub extern "system" fn XMemVirtualAlloc(
         kind |= MEM_RESERVE;
         // The GPU side copies only the pages the title wrote since its last
         // copy (`victory_gpu`, decision 0007); placeholders cannot be
-        // watched (their physical-page views are copied whole).
-        if kind & MEM_RESERVE_PLACEHOLDER == 0 {
+        // watched (their physical-page views are copied whole). The opt-in
+        // filter also leaves CPU-only, read-only and mappable ranges alone.
+        if kind & MEM_RESERVE_PLACEHOLDER == 0 && watch_skip.is_none() {
             kind |= MEM_WRITE_WATCH;
         }
     }
@@ -165,6 +223,25 @@ pub extern "system" fn XMemVirtualAlloc(
                 %error,
                 "XMemVirtualAlloc refused"
             );
+        }
+    } else if watch_filter() {
+        if let Some(reason) = watch_skip {
+            victory_gpu::xmem_watch_skipped(reason, size);
+            tracing::debug!(
+                size,
+                reason,
+                flags = format_args!("{flags:#x}"),
+                protect = format_args!("{requested_protect:#x}"),
+                "XMem reservation left unwatched"
+            );
+        }
+        // Propagate the console's GPU-read-only protection: shaders cannot
+        // write this memory, so the GPU side skips copying it back. A new
+        // writable allocation at the same address clears any stale mark.
+        if requested_protect & PAGE_GRAPHICS_READONLY != 0 {
+            victory_gpu::xmem_gpu_readonly(at as usize, size);
+        } else {
+            victory_gpu::xmem_gpu_writable(at as usize, size);
         }
     }
     if base.is_null() {
@@ -1038,6 +1115,39 @@ mod tests {
         let process = unsafe { GetCurrentProcess() };
         assert_eq!(XMemVirtualQuery(process, address, &mut info), 1);
         info
+    }
+
+    #[test]
+    fn watch_filter_excludes_only_ranges_without_gpu_writes() {
+        // Ordinary graphics read-write memory keeps its watch (the default
+        // path, unchanged when the switch is off).
+        assert_eq!(
+            watch_skip_reason(MEM_RESERVE, GRAPHICS, PAGE_READWRITE | PAGE_GRAPHICS_READWRITE),
+            None
+        );
+        assert_eq!(watch_skip_reason(MEM_RESERVE, XMEM_CPU, PAGE_READWRITE), Some(1));
+        assert_eq!(
+            watch_skip_reason(MEM_RESERVE, GRAPHICS, PAGE_READWRITE | PAGE_GRAPHICS_READONLY),
+            Some(2)
+        );
+        assert_eq!(
+            watch_skip_reason(MEM_RESERVE, GRAPHICS, PAGE_READWRITE | PAGE_GRAPHICS_NOACCESS),
+            Some(2)
+        );
+        assert_eq!(watch_skip_reason(MEM_RESERVE, GRAPHICS, PAGE_READONLY), Some(2));
+        assert_eq!(
+            watch_skip_reason(MEM_RESERVE, GRAPHICS | XMEM_MAPPABLE, PAGE_READWRITE),
+            Some(3)
+        );
+        // 64 KiB placeholders were already unwatched before the switch.
+        assert_eq!(
+            watch_skip_reason(
+                MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                XMEM_CPU,
+                PAGE_GRAPHICS_READONLY
+            ),
+            None
+        );
     }
 
     #[test]

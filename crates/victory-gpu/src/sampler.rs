@@ -82,12 +82,31 @@ impl Fields {
     }
 }
 
-/// Maps a console address mode (`1..=5`) to host D3D12, falling back to `CLAMP`.
-fn address_mode(mode: u32) -> D3D12_TEXTURE_ADDRESS_MODE {
+/// Maps a console address mode to host D3D12, falling back to `CLAMP`.
+/// `1..=5` are the D3D modes; 6 (half border), 7 (mirror once border) and 8
+/// (mirror once half border) are console-only, and take the nearest host
+/// mode: border and mirror once. Also used for the plain, 13-word sampler
+/// descriptions the title makes (`CreateSampler`), whose address fields
+/// carry the same console values.
+pub(crate) fn address_mode(mode: u32) -> D3D12_TEXTURE_ADDRESS_MODE {
     match mode {
         1..=5 => D3D12_TEXTURE_ADDRESS_MODE(mode as i32),
+        6 => {
+            once_console_mode(mode);
+            D3D12_TEXTURE_ADDRESS_MODE_BORDER
+        }
+        7 | 8 => {
+            once_console_mode(mode);
+            D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE
+        }
         _ => D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
     }
+}
+
+/// Warns once about a console-only sampler address mode.
+fn once_console_mode(mode: u32) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| tracing::warn!(mode, "console-only sampler address mode mapped for the host"));
 }
 
 /// Sanitizes an LOD bound for D3D12, substituting `fallback` for `NaN` and clamping infinities.
@@ -146,6 +165,29 @@ mod tests {
     }
 
     #[test]
+    fn console_only_address_modes_take_the_nearest_host_mode() {
+        assert_eq!(address_mode(1), D3D12_TEXTURE_ADDRESS_MODE_WRAP);
+        assert_eq!(address_mode(5), D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE);
+        // Half border, mirror once border, mirror once half border.
+        assert_eq!(address_mode(6), D3D12_TEXTURE_ADDRESS_MODE_BORDER);
+        assert_eq!(address_mode(7), D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE);
+        assert_eq!(address_mode(8), D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE);
+        assert_eq!(address_mode(9), D3D12_TEXTURE_ADDRESS_MODE_CLAMP);
+        // A console sampler description passes the same values through.
+        let mut w = [0u32; 27];
+        w[6..9].copy_from_slice(&[6, 7, 8]);
+        let d = console(&w);
+        assert_eq!(
+            [d.AddressU, d.AddressV, d.AddressW],
+            [
+                D3D12_TEXTURE_ADDRESS_MODE_BORDER,
+                D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE,
+                D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE,
+            ]
+        );
+    }
+
+    #[test]
     fn mip_none_clamps_to_min_lod_and_inverted_lod_range_clamps() {
         let mut w = [0u32; 27];
         w[3] = 0; // mip none
@@ -197,9 +239,15 @@ mod tests {
         w[16] = 99;
         let d = console(&w);
         assert_eq!(d.MipLODBias, D3D12_MIP_LOD_BIAS_MAX);
+        // 0 is not a D3D address mode; the console's half border (6) takes
+        // the host's border mode.
         assert_eq!(
             [d.AddressU, d.AddressV, d.AddressW],
-            [D3D12_TEXTURE_ADDRESS_MODE_CLAMP; 3]
+            [
+                D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                D3D12_TEXTURE_ADDRESS_MODE_BORDER,
+                D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            ]
         );
         assert_eq!(d.ComparisonFunc, D3D12_COMPARISON_FUNC_NEVER);
 

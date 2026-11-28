@@ -94,8 +94,16 @@ pub(crate) enum C {
     MarkedUs,
     MarkedKept,
     SavedPages,
+    /// XMem reservations left unwatched under `VICTORY_XMEM_WATCH_FILTER`,
+    /// by reason (CPU-only, read-only protection, mappable), and their bytes.
+    XmemSkippedCpu,
+    XmemSkippedReadonly,
+    XmemSkippedMappable,
+    XmemSkippedBytes,
+    /// Bytes of GPU copy-backs skipped for `PAGE_GRAPHICS_READONLY` memory.
+    ReadOnlySkippedBytes,
 }
-const COUNTERS: usize = 57;
+const COUNTERS: usize = 62;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -291,6 +299,20 @@ pub(crate) fn log(frames: f64) {
             (hard - HARD.swap(hard, Relaxed).min(hard)) as f64 / frames
         },
     );
+    let skipped = c[C::XmemSkippedCpu as usize]
+        + c[C::XmemSkippedReadonly as usize]
+        + c[C::XmemSkippedMappable as usize];
+    if skipped > 0. || c[C::ReadOnlySkippedBytes as usize] > 0. {
+        tracing::info!(
+            "xmem watch filter: {:.0} ranges skipped ({:.0} CPU-only, {:.0} read-only, {:.0} mappable; {:.1} MB); GPU copy-backs skipped for read-only memory: {:.1} MB",
+            skipped,
+            c[C::XmemSkippedCpu as usize],
+            c[C::XmemSkippedReadonly as usize],
+            c[C::XmemSkippedMappable as usize],
+            mb(c[C::XmemSkippedBytes as usize]),
+            mb(c[C::ReadOnlySkippedBytes as usize]),
+        );
+    }
     let held: Vec<String> = crate::watch::held_times()
         .iter()
         .map(|(line, total, longest)| format!("watch.rs:{line} {:.1} ms (longest {longest:.1})", total / frames))

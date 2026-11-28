@@ -338,7 +338,7 @@ impl Shadow {
     pub(crate) fn copy_back_page(&self, page: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (page.max(start), (page + PAGE).min(end));
-        if from >= to {
+        if from >= to || crate::watch::skip_gpu_copy_back(from, to) {
             return 0;
         }
         if let Some(t) = &self.tracked
@@ -525,6 +525,7 @@ impl Shadow {
         if let Some((taken, before)) = segments.iter().find(|(at, bytes)| *at <= from && to <= at + bytes.len())
             && back
             && from < to
+            && !crate::watch::skip_gpu_copy_back(from, to)
         {
             let before = &before[from - taken..to - taken];
             #[cfg(feature = "diagnostics")]
@@ -613,7 +614,7 @@ impl Shadow {
         };
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (page.max(start), (page + PAGE).min(end));
-        if from >= to {
+        if from >= to || crate::watch::skip_gpu_copy_back(from, to) {
             return 0;
         }
         // Our own write below must not save the page for this copy again.

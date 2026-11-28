@@ -359,6 +359,7 @@ Switches below are off when unset or `0`, unless the row says otherwise.
 | `VICTORY_CARD_BUFFERS_MB=<n>` | cap on host copies of title buffers |
 | `VICTORY_CARD_BUFFERS_MIN_KB=<n>` | copies smaller than this bypass the cap — set low to make the cap effective |
 | `VICTORY_SNAPSHOT_POOL_MIB=<n>` | snapshot buffers kept for reuse (default 512 MiB, was hardcoded 2 GiB; 0 disables reuse) — lowers resident memory on 16 GB machines |
+| `VICTORY_XMEM_WATCH_FILTER=1` | opt-in (default **off**) XMem write-watch filter: leaves CPU-only, `PAGE_GRAPHICS_NOACCESS`/`READONLY`, host read-only/no-access and `XMEM_MAPPABLE` reservations unwatched; GPU copy-backs of `PAGE_GRAPHICS_READONLY` memory are skipped. Unwatched ranges a host copy takes are copied whole on refresh, so A/B the frame log (`xmem watch filter: … ranges skipped …`) before keeping it on |
 | `VICTORY_IDLE_RECLAIM=0` | turn off the periodic release of idle title-memory shadow windows (on by default; reclaim starts past **half** of `VICTORY_CARD_BUFFERS_MB`, or at the window ceiling, and then drops every unused window) |
 | `VICTORY_IDLE_FRAMES=<n>` | ticks without a use before a window goes when there is no pressure (default 2; was 4) |
 | `VICTORY_ROOT_VIEW_WINDOWS=<n>` | hard ceiling on live loose root-view windows, with oldest-used eviction (default 256) |
@@ -393,6 +394,14 @@ $env:VICTORY_MESH_BUFFER_MB      = '16'     # output scratch inside that ceiling
 $env:VICTORY_ROOT_VIEW_SINK_MB   = '64'     # arena of 1 MiB slots for no-copy root views; 0 = always null
 $env:VICTORY_ROOT_VIEW_REGISTERED_LOOSE = '1' # default; 0 restores the per-address sink/null baseline
 ```
+
+`VICTORY_XMEM_WATCH_FILTER=1` is a separate A/B experiment, **off by default**:
+XMem reservations that are CPU-only, GPU/host read-only, or mappable
+(physical-page placeholders) are left unwatched, and host copies do not put
+bytes back into `PAGE_GRAPHICS_READONLY` allocations. A diagnostics build logs
+`xmem watch filter: … ranges skipped …` next to the `watches … MB checked`
+line; keep the switch only if the check overhead drops more than the whole
+copies of unwatched ranges cost.
 
 The mesh budget is what keeps the recovered ~4000 indirect draws/frame from
 turning into an allocation failure at scene load: it renders far more geometry

@@ -726,26 +726,96 @@ macro_rules! once {
     }};
 }
 
+/// The console's `D3D12XBOX_BUFFER_SRV_FLAG_STRIDED_TYPED`. It names a typed
+/// buffer with a stride, a combination the host does not have: it takes a
+/// typed format with no stride, or a stride with an unknown format.
+const STRIDED_TYPED: i32 = 0x2;
+
 /// A view description from its words, with the format as the host has it.
 fn srv_desc(words: &[u32; 10]) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
     let mut words = *words;
     words[0] = crate::resource::pc_format(words[0]);
     // SAFETY: 40 bytes in the host's layout.
-    unsafe {
+    let mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC = unsafe {
         std::ptr::from_ref(&words)
             .cast::<D3D12_SHADER_RESOURCE_VIEW_DESC>()
             .read_unaligned()
-    }
+    };
+    normalize_srv(&mut desc);
+    desc
 }
 
 fn uav_desc(words: &[u32; 10]) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
     let mut words = *words;
     words[0] = crate::resource::pc_format(words[0]);
     // SAFETY: 40 bytes in the host's layout.
-    unsafe {
+    let mut desc: D3D12_UNORDERED_ACCESS_VIEW_DESC = unsafe {
         std::ptr::from_ref(&words)
             .cast::<D3D12_UNORDERED_ACCESS_VIEW_DESC>()
             .read_unaligned()
+    };
+    normalize_uav(&mut desc);
+    desc
+}
+
+/// Makes a console buffer SRV one the host takes: drop the strided-typed
+/// flag, and turn a typed format with a stride into a structured view (or a
+/// flag without either into a raw one). The stride is what shaders index by,
+/// so it is kept wherever the title gave one. All paths that need a view's
+/// format, stride or range go through [`srv_desc`], so they agree with the
+/// view the host makes.
+fn normalize_srv(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC) {
+    if desc.ViewDimension != D3D12_SRV_DIMENSION_BUFFER {
+        return;
+    }
+    // SAFETY: a buffer view's union member.
+    let buffer = unsafe { &mut desc.Anonymous.Buffer };
+    let console = buffer.Flags.0 & STRIDED_TYPED != 0;
+    let typed = desc.Format != DXGI_FORMAT_UNKNOWN;
+    if !console && !(typed && buffer.StructureByteStride != 0) {
+        return;
+    }
+    once!(
+        format = desc.Format.0,
+        stride = buffer.StructureByteStride,
+        flags = buffer.Flags.0,
+        "console strided-typed buffer SRV normalized for the host"
+    );
+    buffer.Flags.0 &= !STRIDED_TYPED;
+    if typed && buffer.StructureByteStride != 0 {
+        desc.Format = DXGI_FORMAT_UNKNOWN;
+        buffer.Flags.0 &= !D3D12_BUFFER_SRV_FLAG_RAW.0;
+    } else if !typed && buffer.StructureByteStride == 0 {
+        desc.Format = DXGI_FORMAT_R32_TYPELESS;
+        buffer.Flags.0 |= D3D12_BUFFER_SRV_FLAG_RAW.0;
+    }
+}
+
+/// [`normalize_srv`] for unordered access views.
+fn normalize_uav(desc: &mut D3D12_UNORDERED_ACCESS_VIEW_DESC) {
+    if desc.ViewDimension != D3D12_UAV_DIMENSION_BUFFER {
+        return;
+    }
+    // SAFETY: a buffer view's union member.
+    let buffer = unsafe { &mut desc.Anonymous.Buffer };
+    let console = buffer.Flags.0 & STRIDED_TYPED != 0;
+    let typed = desc.Format != DXGI_FORMAT_UNKNOWN;
+    if !console && !(typed && buffer.StructureByteStride != 0) {
+        return;
+    }
+    once!(
+        format = desc.Format.0,
+        stride = buffer.StructureByteStride,
+        flags = buffer.Flags.0,
+        "console strided-typed buffer UAV normalized for the host"
+    );
+    buffer.Flags.0 &= !STRIDED_TYPED;
+    if typed && buffer.StructureByteStride != 0 {
+        desc.Format = DXGI_FORMAT_UNKNOWN;
+        buffer.Flags.0 &= !D3D12_BUFFER_UAV_FLAG_RAW.0;
+    } else if !typed && buffer.StructureByteStride == 0 {
+        desc.Format = DXGI_FORMAT_R32_TYPELESS;
+        buffer.Flags.0 |= D3D12_BUFFER_UAV_FLAG_RAW.0;
     }
 }
 
@@ -1293,11 +1363,16 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
         }
         View::Sampler(words) => {
             // SAFETY: 13 words in the host's layout.
-            let desc = unsafe {
+            let mut desc: D3D12_SAMPLER_DESC = unsafe {
                 std::ptr::from_ref(words)
                     .cast::<D3D12_SAMPLER_DESC>()
                     .read_unaligned()
             };
+            // The console's half-border modes are not host address modes;
+            // named ones would be refused with a removed device.
+            desc.AddressU = crate::sampler::address_mode(desc.AddressU.0 as u32);
+            desc.AddressV = crate::sampler::address_mode(desc.AddressV.0 as u32);
+            desc.AddressW = crate::sampler::address_mode(desc.AddressW.0 as u32);
             // SAFETY: a slot of our sampler heap.
             unsafe { device.CreateSampler(&desc, at) };
             Some(None)
@@ -1530,6 +1605,52 @@ mod tests {
         assert!(!within(64, 0, 0, 16));
         assert!(!within(64, 3, 2, 16));
         assert!(!within(64, u64::MAX, 1, 16));
+    }
+
+    /// The console's strided-typed buffer flag is not a host flag: keep the
+    /// stride as a structured view's, or fall back to a raw one, so the host
+    /// takes the view instead of refusing a typed format with a stride.
+    #[test]
+    fn strided_typed_buffer_views_are_normalized() {
+        let mut words = [0u32; 10];
+        words[0] = 28; // R8G8B8A8_UNORM
+        words[1] = 1; // buffer
+        words[2] = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING as u32;
+        words[6] = 4; // NumElements
+        words[7] = 16; // StructureByteStride
+        words[8] = STRIDED_TYPED as u32;
+        let srv = srv_desc(&words);
+        assert_eq!(srv.Format, DXGI_FORMAT_UNKNOWN, "structured, not typed");
+        // SAFETY: a buffer view's union member.
+        let buffer = unsafe { srv.Anonymous.Buffer };
+        assert_eq!(buffer.StructureByteStride, 16);
+        assert_eq!(buffer.Flags.0 & STRIDED_TYPED, 0);
+
+        let mut uav_words = [0u32; 10];
+        uav_words[0] = 28;
+        uav_words[1] = 1;
+        uav_words[4] = 4; // NumElements
+        uav_words[5] = 16; // StructureByteStride
+        uav_words[8] = STRIDED_TYPED as u32;
+        let uav = uav_desc(&uav_words);
+        assert_eq!(uav.Format, DXGI_FORMAT_UNKNOWN);
+        // SAFETY: a buffer view's union member.
+        let buffer = unsafe { uav.Anonymous.Buffer };
+        assert_eq!(buffer.StructureByteStride, 16);
+        assert_eq!(buffer.Flags.0 & STRIDED_TYPED, 0);
+
+        // Without a stride the flag only named a typed buffer; keeping the
+        // typed format and clearing the flag is enough. With neither, raw.
+        words[7] = 0;
+        let typed = srv_desc(&words);
+        assert_eq!(typed.Format, DXGI_FORMAT_R8G8B8A8_UNORM);
+        // SAFETY: a buffer view's union member.
+        assert_eq!(unsafe { typed.Anonymous.Buffer }.Flags.0, 0);
+        words[0] = 0;
+        let raw = srv_desc(&words);
+        assert_eq!(raw.Format, DXGI_FORMAT_R32_TYPELESS);
+        // SAFETY: a buffer view's union member.
+        assert_ne!(unsafe { raw.Anonymous.Buffer }.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0, 0);
     }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's

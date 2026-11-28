@@ -522,6 +522,21 @@ fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
 
+/// Whether a barycentric input whose first use is a live data join is loaded
+/// there instead of being refused as "a join of mismatched values" (upstream
+/// VIctory PR #570, "including on live phi edges").
+///
+/// On by default; `VICTORY_JOIN_FIX=0` restores the old refusal (for A/B
+/// comparisons). The flag is part of the shader-cache key, so changing it
+/// translates again rather than serving a cached refusal.
+pub(crate) fn join_fix_enabled() -> bool {
+    static FIX: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FIX.get_or_init(|| match std::env::var("VICTORY_JOIN_FIX") {
+        Ok(value) => value.trim() != "0",
+        Err(_) => true,
+    })
+}
+
 /// The dwords an `s_load_dword*` reads.
 fn smem_dwords(name: &str) -> Option<u32> {
     match name.strip_prefix("s_load_dword")? {
@@ -11020,7 +11035,28 @@ impl<'a> Lower<'a> {
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let arg = phi.args[n];
                 let read = live.contains(&(phi.value, n));
-                let x = match (self.vals.get(&arg).copied(), bit) {
+                let mut value = self.vals.get(&arg).copied();
+                // A console barycentric is loaded on first use (`inputs`),
+                // and a join can be that first use. Without this the phi
+                // has no incoming DXIL value and the program is refused even
+                // though the input is perfectly expressible. `load_any_input`
+                // emits into the entry block, so it dominates every use.
+                if value.is_none() && read && !bit && join_fix_enabled() {
+                    if let Some(loaded) = self.lazy_barycentric(arg) {
+                        value = Some(match loaded {
+                            Ok(()) => self.vals[&arg],
+                            Err(why) => Val::Missing(why),
+                        });
+                        static REPORTED: std::sync::Once = std::sync::Once::new();
+                        REPORTED.call_once(|| {
+                            eprintln!(
+                                "victory-shader: VICTORY_JOIN_FIX: loaded a barycentric input on a live phi edge at {:#x}",
+                                p.blocks[b].offset
+                            );
+                        });
+                    }
+                }
+                let x = match (value, bit) {
                     (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
                     // No lane from this edge reads it, or no lane comes
                     // along it at all: any value will do.

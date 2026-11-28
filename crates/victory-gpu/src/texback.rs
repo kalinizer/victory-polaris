@@ -116,6 +116,11 @@ impl Target {
         let copy = crate::resource::host_copy(resource)?;
         let _mapping = crate::watch::title_memory_reading();
         let (layout, at, size) = crate::resource::title_texture(resource)?;
+        // The runtime declared this allocation GPU read-only: no shader could
+        // have written the texels, so there is nothing to tile back.
+        if crate::watch::skip_gpu_copy_back(at, size) {
+            return None;
+        }
         let end = at.checked_add(size).filter(|&end| at != 0 && end > at)?;
         let ticket = track(resource as usize, at, end);
         Some(Self { copy, layout, ticket })
