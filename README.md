@@ -359,6 +359,7 @@ Switches below are off when unset or `0`, unless the row says otherwise.
 | `VICTORY_AMBIENT_SHADE=<strength>,<radius>` | creases' shade (default `1.0,0.6`) |
 | `VICTORY_AMBIENT_SETTLE=<ms>[,<jump>[,<fresh s>]]` | slow mean's settling (default `250,3`; `0` disables clock-based settling) |
 | `VICTORY_AMBIENT_AIR=<multiple>` | cap what the air scatters by a multiple of the light around (off by default) |
+| `VICTORY_LIGHT_FORMAT_FLOAT=1` | host the packed light image as RGBA16F instead of packed R9G9B9E5 in R32_UINT. The effective format is one cached decision shared by resource creation, views, clears, copies and the Resolve gate; default off keeps the title's formats byte for byte |
 | `VICTORY_FALLBACK_HEAPS=1` | bind one-slot shader-visible host view/sampler heaps where a list sets none, for directly-indexed root signatures (a UI draw that sets no heaps otherwise samples null descriptors and shows a flat gradient) |
 | `VICTORY_PRESENT_ALL_RESOURCES=1` | show every resource listed by a PresentX plane, not just the first (planes here have `count=1`, so this changes nothing on this title — kept as a diagnostic) |
 | `VICTORY_PRESENT_BASE_SIZE` | compose at the base plane's size (on by default here, for a 1080p display); `=0` restores the largest-plane size, which scales the 1080p scene to 4K and blurs the UI |
@@ -373,7 +374,7 @@ Switches below are off when unset or `0`, unless the row says otherwise.
 | `VICTORY_IDLE_FRAMES=<n>` | ticks without a use before a window goes when there is no pressure (default 2; was 4) |
 | `VICTORY_ROOT_VIEW_WINDOWS=<n>` | hard ceiling on live loose root-view windows, with oldest-used eviction (default 256) |
 | `VICTORY_ROOT_VIEW_REGISTERED_LOOSE=1\|0` | route root views of registered buffers refused by `VICTORY_CARD_BUFFERS_MB` into bounded loose windows instead of per-address sinks (on by default; `0` restores the baseline sink/null fallback, the single-buffer sink pool and un-deduped fills) |
-| `VICTORY_ROOT_VIEW_MB=<n>` | cap on the bytes refreshed per root view (default **1** MiB). `0` explicitly means unlimited (refresh to the copy's end): risky here — it made ~1000 root views/frame copy ~1.3 GB/frame and fail with `0x8007000E`. A positive value larger than 1 may be needed if a shader's data sits past the first MiB |
+| `VICTORY_ROOT_VIEW_MB=<n>` | cap on the bytes refreshed per root view (default **1** MiB). `0`, `unlimited` and values above 513 MiB are now warned about and rejected, falling back to the default: an earlier unbounded path copied ~1.3 GB/frame and failed with `0x8007000E`. A positive value larger than 1 may be needed if a shader's data sits past the first MiB |
 | `VICTORY_ROOT_VIEW_SINK_MB=<n>` | size of the single sink arena (1 MiB slots) for root SRV/UAV views with no host copy (default **64** MiB = 64 slots; CBVs use 64 KiB upload scratch and never enter the pool). `0` disables sinks and always binds a null raw view. With `VICTORY_ROOT_VIEW_REGISTERED_LOOSE=0` each sink is a separate buffer instead. Without a cap ~5000 refusals/frame each kept a fresh 1 MiB buffer until list reset, exhausting commit at scene load (`0x8007000E`) |
 | `VICTORY_RENDER_SCALE=<factor>` | shrink the **swap chain** only (`0.5`, `0.75`; `1`/unset keeps the title's size). The title still renders into its own targets, so this saves swap-chain memory and sampling work, **not** the 7+ GB of host textures. A scaled single plane goes through the sampling compositor instead of `CopyResource` |
 | `VICTORY_UI_RESOLUTION=<WIDTHxHEIGHT>` | opt-in: before title code starts, set the screen size the title saved in its own `settings.xml` (`<resolutionFullscreen>`) to this size, keeping one `settings.xml.bak`. The title lays out its UI for the **saved** size, not the presented one: a 4K save on a 1080p screen makes the UI twice too big, and the compositor's 4K→1080p downsample blurs the text (`clankenjoyer/scarlet-fps` 000954708c, `-Res`). Unset: no change. `=restore` copies the backup back. Touches only the title's user data under the configured data dir, never the game package |
@@ -381,6 +382,13 @@ Switches below are off when unset or `0`, unless the row says otherwise.
 | `VICTORY_TEXTURE_MB=<n>` | per-texture host allocation budget in MiB, clamped to VRAM/4 (the small-VRAM preset rule). Top mips are left out until the estimated allocation fits; combines with `VICTORY_TEXTURE_MAX`. Unset: no byte budget |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | record what the title plays |
 | `VICTORY_XMA_DUMP=<dir>` | save the first 32 XMA voices' context and input |
+| `VICTORY_UI_DOWNSAMPLE=level\|box4` | `box4` averages four taps when the 3840×2160 interface plane is composed into 1920×1080; the default `level` keeps the original single bilinear tap, which can erase thin glyph strokes |
+| `VICTORY_UI_ALPHA=premul\|straight` | chooses the interface-plane blend equation; default `premul` matches the current premultiplied path |
+| `VICTORY_UI_ALPHA_HIST=1` | log-only alpha histogram of the interface plane (no image dumps) |
+| `VICTORY_LOG_WRITERS=1` | log-only writer rows for render targets, including a bounded interface-plane mode |
+| `VICTORY_DUMP_INTERFACE_ONLY=1` | scope writer dumps to the 3840×2160 interface plane; dump destinations are validated to stay outside the repository |
+| `VICTORY_SHADER_DIAG=1` | log the barycentric capability verdict and refusal counts by reason |
+| `VICTORY_MESH_ATTR_DIAG=1` | bounded CPU-side report of the emulated-mesh vertex record layout (overruns, overlaps, zero columns) |
 
 ### Memory switches for this card (opt-in)
 
