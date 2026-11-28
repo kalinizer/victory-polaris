@@ -1665,6 +1665,54 @@ fn fspx_programs_run_with_the_hardwares_dot_products() {
     }
 }
 
+/// A constant multiplicand must retain signed bytes in either source slot,
+/// including after VOP3P half selection and with a runtime accumulator.
+#[test]
+fn byte_dot_products_with_constant_multiplicands() {
+    let inputs = [
+        [0x0302_FB02, 0, 0x7FFF_FFF0, 0],
+        [0x8080_8080, 0, 0xFFFF_FFFF, 0],
+        [0x7F7F_7F7F, 0, 0x8000_0000, 0],
+        [0xFF01_80FF, 0, 0, 0],
+    ];
+    for packed in [0, 0x80FF_7F01, 0xFFFF_FFFF, 0x4000_0000] {
+        for constant_first in [false, true] {
+            for swap in [false, true] {
+                let (a, b, select) = if constant_first {
+                    (vgpr(2), vgpr(1), 1)
+                } else {
+                    (vgpr(1), vgpr(2), 2)
+                };
+                let opsel = if swap { select } else { 0 };
+                let mut body = vec![vop1(0x001, 2, 0xFF), packed];
+                body.extend(dot4(0, a, b, vgpr(3), opsel, 7 ^ opsel));
+                let shader = build_valu_cs(&body);
+                let constant = if swap { packed.rotate_left(16) } else { packed };
+                run_cases(&shader, &inputs, |backend, _, input, got| {
+                    assert_eq!(
+                        got,
+                        dot4_ref(input[0], constant, input[2]),
+                        "{backend}: constant {packed:08x}, first {constant_first}, swap {swap}"
+                    );
+                });
+            }
+        }
+        let shader = build_valu_cs(&[
+            vop1(0x001, 2, 0xFF),
+            packed,
+            vop1(0x001, 0, vgpr(3)),
+            0x0d << 25 | 2 << 9 | vgpr(1) as u32,
+        ]);
+        run_cases(&shader, &inputs, |backend, _, input, got| {
+            assert_eq!(
+                got,
+                dot4_ref(input[0], packed, input[2]),
+                "{backend}: dot4c constant {packed:08x}"
+            );
+        });
+    }
+}
+
 /// `v_pk_fmac_f16` (VOP2): each half of the destination plus the product
 /// of the sources' halves.
 #[test]
